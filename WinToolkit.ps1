@@ -299,9 +299,9 @@ function Invoke-WithSpinner {
             }
 
             # Clear line and show completion
-            if (-not $Global:GuiSessionActive) {
+            if (-not $Global:GuiSessionActive)
                 Clear-ProgressLine
-            }
+
             Show-ProgressBar -Activity $Activity -Status 'Completato' -Percent 100 -Icon '✅'
             if (-not $Global:GuiSessionActive) { Write-Host "" } # Add newline after completion
             return @{ Success = $true; TimedOut = $false; ExitCode = $result.ExitCode }
