@@ -303,7 +303,9 @@ function Invoke-WithSpinner {
                 Clear-ProgressLine
 
             Show-ProgressBar -Activity $Activity -Status 'Completato' -Percent 100 -Icon '✅'
-            if (-not $Global:GuiSessionActive) { Write-Host "" } # Add newline after completion
+            if (-not $Global:GuiSessionActive)
+                Write-Host "" # Add newline after completion
+
             return @{ Success = $true; TimedOut = $false; ExitCode = $result.ExitCode }
         }
         elseif ($Job -and $result -and $result.GetType().Name -eq 'Job') {
