@@ -309,11 +309,10 @@ function Invoke-WithSpinner {
             Write-Host ''
             return $jobResult
         }
-        else {
-            # Operazione sincrona semplice
-            Start-Sleep -Seconds $TimeoutSeconds
-            return $result
-        }
+        
+        # Operazione sincrona semplice
+        Start-Sleep -Seconds $TimeoutSeconds
+        return $result
     }
     catch {
         Write-StyledMessage -Type 'Error' -Text "Errore durante $Activity`: $($_.Exception.Message)"
