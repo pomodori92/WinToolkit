@@ -591,9 +591,8 @@ function WinRepairToolkit {
                 }
 
                 # Fallback: Se il processo fallisce ma i log non contengono keyword di errore
-                if ($errors.Count -eq 0 -and -not $isTimeout) {
+                if ($errors.Count -eq 0 -and -not $isTimeout)
                     $errors += "Errore generico o terminazione anomala (ExitCode: $exitCode)."
-                }
             }
 
             # FIX: La variabile di successo deve richiedere che l'operazione non sia fallita/andata in timeout
@@ -623,9 +622,8 @@ function WinRepairToolkit {
                         Copy-Item -Path $cbsLogPath -Destination $destLogPath -Force -ErrorAction SilentlyContinue
 
                         # Verifica post-copia per dare un feedback accurato
-                        if (Test-Path $destLogPath) {
+                        if (Test-Path $destLogPath)
                             Write-StyledMessage Info "📄 Log SFC salvato in: $destLogName"
-                        }
                     }
                     catch {
                         Write-StyledMessage Warning "⚠️ Impossibile esportare il log CBS di SFC (file in uso)."
