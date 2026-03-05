@@ -1413,9 +1413,9 @@ function WinReinstallStore {
                 [System.Environment]::SetEnvironmentVariable('PATH', $userEnvPath, [System.EnvironmentVariableTarget]::User)
             }
 
-            if (-not ($env:PATH -split ';').Contains($PathToAdd)) {
+            if (-not ($env:PATH -split ';').Contains($PathToAdd))
                 $env:PATH += ";$PathToAdd"
-            }
+
             Write-StyledMessage -Type 'Info' -Text "PATH aggiornato: $PathToAdd"
         }
     }
@@ -1429,7 +1429,8 @@ function WinReinstallStore {
             [string]$FolderPath
         )
 
-        if (-not (Test-Path $FolderPath)) { return }
+        if (-not (Test-Path $FolderPath))
+            return
 
         try {
             $administratorsGroupSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
