@@ -886,14 +886,12 @@ function WinUpdateReset {
                 Write-Host $clearLines -NoNewline
                 [Console]::Out.Flush()
 
-                if (-not (Test-Path $path)) {
-                    Write-StyledMessage Success "🗑️ Directory $displayName eliminata (metodo forzato)."
-                    return $true
-                }
-                else {
+                if (Test-Path $path) {
                     Write-StyledMessage Warning "Directory $displayName parzialmente eliminata."
                     return $false
                 }
+                Write-StyledMessage Success "🗑️ Directory $displayName eliminata (metodo forzato)."
+                return $true
             }
             catch {
                 Write-StyledMessage Warning "Impossibile eliminare completamente $displayName - file in uso."
