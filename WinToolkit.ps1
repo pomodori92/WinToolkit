@@ -247,12 +247,8 @@ function Invoke-WithSpinner {
                 $spinner = $Global:Spinners[$spinnerIndex++ % $Global:Spinners.Length]
                 $elapsed = $totalSeconds - $i
 
-                if ($PercentUpdate) {
-                    $percent = & $PercentUpdate
-                }
-                else {
-                    $percent = [math]::Round((($totalSeconds - $i) / $totalSeconds) * 100)
-                }
+                $percent = if ($PercentUpdate) { & $PercentUpdate } 
+                    else { [math]::Round((($totalSeconds - $i) / $totalSeconds) * 100) }
 
                 # Only write to console if NOT in GUI session
                 if (-not $Global:GuiSessionActive) {
