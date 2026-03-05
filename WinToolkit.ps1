@@ -157,9 +157,9 @@ function Show-Header {
         "       Versione $ToolkitVersion"
     )
     Write-Host ('═' * ($width - 1)) -ForegroundColor Green
-    foreach ($line in $asciiArt) {
+    foreach ($line in $asciiArt)
         Write-Host (Center-Text $line $width) -ForegroundColor White
-    }
+
     Write-Host ('═' * ($width - 1)) -ForegroundColor Green
     Write-Host ''
 }
