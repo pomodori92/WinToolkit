@@ -255,7 +255,9 @@ function Invoke-WithSpinner {
                 }
                 Start-Sleep -Seconds 1
             }
-            if (-not $Global:GuiSessionActive) { Write-Host '' }
+            if (-not $Global:GuiSessionActive)
+                Write-Host ''
+
             return $true
         }
         elseif ($Process -and $result -and $result.GetType().Name -eq 'Process') {
