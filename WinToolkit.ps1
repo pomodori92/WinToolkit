@@ -343,9 +343,8 @@ function Start-InterruptibleCountdown {
     )
 
     # Se il parametro Suppress è attivo, ritorna immediatamente senza countdown
-    if ($Suppress) {
+    if ($Suppress)
         return $true
-    }
 
     Write-StyledMessage -Type 'Info' -Text '💡 Premi un tasto qualsiasi per annullare...'
     Write-Host ''
