@@ -563,9 +563,8 @@ function WinRepairToolkit {
             $errors = $warnings = @()
             if (-not $isSuccess) {
                 # Se c'è stato un timeout, forza un errore
-                if ($isTimeout) {
+                if ($isTimeout)
                     $errors += "Timeout: L'operazione ha superato il tempo limite ed è stata terminata."
-                }
 
                 foreach ($line in ($results | Where-Object { $_ -and ![string]::IsNullOrWhiteSpace($_.Trim()) })) {
                     $trim = $line.Trim()
