@@ -653,10 +653,12 @@ function WinRepairToolkit {
         $totalErrors = $successCount = 0
         for ($toolIndex = 0; $toolIndex -lt $RepairTools.Count; $toolIndex++) {
             $result = Invoke-RepairCommand -Config $RepairTools[$toolIndex] -Step ($toolIndex + 1) -Total $RepairTools.Count
-            if ($result.Success) { $successCount++ }
-            if (!$result.Success -and !($RepairTools[$toolIndex].ContainsKey('IsCritical') -and !$RepairTools[$toolIndex].IsCritical)) {
+            if ($result.Success)
+                $successCount++
+
+            if (!$result.Success -and !($RepairTools[$toolIndex].ContainsKey('IsCritical') -and !$RepairTools[$toolIndex].IsCritical))
                 $totalErrors += $result.ErrorCount
-            }
+
             Start-Sleep 1
         }
 
