@@ -396,7 +396,9 @@ function Get-SystemInfo {
 function Get-BitlockerStatus {
     try {
         $out = & manage-bde -status C: 2>&1
-        if ($out -match "Stato protezione:\s*(.*)") { return $matches[1].Trim() }
+        if ($out -match "Stato protezione:\s*(.*)")
+            return $matches[1].Trim()
+
         return "Non configurato"
     }
     catch { return "Disattivato" }
