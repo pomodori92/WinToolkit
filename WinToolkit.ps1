@@ -415,7 +415,6 @@ function WinOSCheck {
         Write-StyledMessage -Type 'Warning' -Text "Info sistema non disponibili."
         return
     }
-
     Write-StyledMessage -Type 'Info' -Text "Sistema: $($si.ProductName) ($($si.DisplayVersion))"
 
     if ($si.BuildNumber -ge 22000)
@@ -428,7 +427,8 @@ function WinOSCheck {
         Write-StyledMessage -Type 'Error' -Text "$(Center-Text '🤣 ERRORE CRITICO 🤣' 65)"
         Write-StyledMessage -Type 'Error' -Text "Davvero pensi che questo script possa fare qualcosa per questa versione?"
         Write-Host "  Vuoi rischiare? [Y/N]" -ForegroundColor Yellow
-        if ((Read-Host) -notmatch '^[Yy]$') { exit }
+        if ((Read-Host) -notmatch '^[Yy]$')
+            exit
     }
     Start-Sleep -Seconds 2
 }
