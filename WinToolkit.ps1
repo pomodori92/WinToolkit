@@ -1497,19 +1497,14 @@ function WinReinstallStore {
             $resolveWingetPath = Resolve-Path -Path $wingetPathToResolve -ErrorAction Stop | Sort-Object {
                 [version]($_.Path -replace '^[^\d]+_((\d+\.)*\d+)_.*', '$1')
             }
-
-            if ($resolveWingetPath) {
+            if ($resolveWingetPath)
                 $wingetPath = $resolveWingetPath[-1].Path
-            }
 
             $wingetExe = Join-Path $wingetPath 'winget.exe'
-
             if (Test-Path -Path $wingetExe) {
                 return $wingetExe
-            }
-            else {
-                return $null
-            }
+            
+            return $null
         }
         catch {
             return $null
@@ -1563,7 +1558,6 @@ function WinReinstallStore {
             Where-Object { $_.Id -ne $PID } | 
             Stop-Process -Force -ErrorAction SilentlyContinue
         }
-        
         Start-Sleep 2
         Write-StyledMessage -Type 'Success' -Text "Processi interferenti chiusi."
     }
@@ -1582,9 +1576,8 @@ function WinReinstallStore {
             $wingetDir = Get-ChildItem -Path "$env:ProgramFiles\WindowsApps" -Filter "Microsoft.DesktopAppInstaller_*_*${arch}__8wekyb3d8bbwe" -ErrorAction SilentlyContinue | 
             Sort-Object Name -Descending | Select-Object -First 1
             
-            if ($wingetDir) {
+            if ($wingetDir)
                 $wingetFolderPath = $wingetDir.FullName
-            }
         }
         catch { }
 
@@ -1607,7 +1600,7 @@ function WinReinstallStore {
         try {
             # 1. Usa Stop-InterferingProcess come in start.ps1
             Stop-InterferingProcess
-            
+
             $wingetCachePath = "$env:LOCALAPPDATA\WinGet"
             if (Test-Path $wingetCachePath) {
                 Write-StyledMessage -Type 'Info' -Text "Pulizia cache Winget..."
@@ -1620,12 +1613,12 @@ function WinReinstallStore {
                     catch { }
                 }
             }
-            
+
             $stateFiles = @(
                 "$env:LOCALAPPDATA\WinGet\Data\USERTEMPLATE.json",
                 "$env:LOCALAPPDATA\WinGet\Data\DEFAULTUSER.json"
             )
-            
+
             foreach ($file in $stateFiles) {
                 if (Test-Path $file -PathType Leaf) {
                     Write-StyledMessage -Type 'Info' -Text "Reset file stato: $file"
@@ -1640,7 +1633,6 @@ function WinReinstallStore {
             catch {
                 Write-StyledMessage -Type 'Warning' -Text "Errore durante reset sorgenti Winget: $($_.Exception.Message)"
             }
-            
             Update-EnvironmentPath
             
             try {
@@ -1652,17 +1644,15 @@ function WinReinstallStore {
             catch {
                 Write-StyledMessage -Type 'Warning' -Text "Modulo Riparazione non disponibile: $($_.Exception.Message)"
             }
-            
+
             Start-Sleep 2
             $testVersion = & winget --version *>$null
             if ($LASTEXITCODE -eq 0) {
                 Write-StyledMessage -Type 'Success' -Text "Database Winget ripristinato (versione: $testVersion)."
-                return $true
-            }
-            else {
+            else
                 Write-StyledMessage -Type 'Warning' -Text "Ripristino completato ma winget potrebbe non funzionare."
-                return $true
-            }
+
+            return $true
         }
         catch {
             Write-StyledMessage -Type 'Error' -Text "Errore durante ripristino database: $($_.Exception.Message)"
