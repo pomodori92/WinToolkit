@@ -1688,16 +1688,16 @@ function WinReinstallStore {
                 }
             }
 
-            if ($exitCode -eq 0) {
-                Write-StyledMessage -Type 'Success' -Text "Test profondo superato: Winget comunica correttamente con i repository."
-                return $true
-            }
-            else {
+            if ($exitCode -ne 0) {
                 $errorDetails = $searchResult | Out-String
-                if ($errorDetails.Length -gt 200) { $errorDetails = $errorDetails.Substring(0, 200) + "..." }
+                if ($errorDetails.Length -gt 200)
+                    $errorDetails = $errorDetails.Substring(0, 200) + "..."
+
                 Write-StyledMessage -Type 'Warning' -Text "Test profondo fallito: ExitCode=$exitCode. Dettagli: $errorDetails"
                 return $false
             }
+            Write-StyledMessage -Type 'Success' -Text "Test profondo superato: Winget comunica correttamente con i repository."
+            return $true
         }
         catch {
             Write-StyledMessage -Type 'Error' -Text "Errore durante il test profondo di Winget: $($_.Exception.Message)"
