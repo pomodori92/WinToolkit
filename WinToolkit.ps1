@@ -938,9 +938,8 @@ function WinUpdateReset {
     try {
         Write-StyledMessage Info '🛑 Arresto servizi Windows Update...'
         $stopServices = @('wuauserv', 'cryptsvc', 'bits', 'msiserver')
-        for ($serviceIndex = 0; $serviceIndex -lt $stopServices.Count; $serviceIndex++) {
+        for ($serviceIndex = 0; $serviceIndex -lt $stopServices.Count; $serviceIndex++)
             Manage-Service $stopServices[$serviceIndex] 'Stop' $serviceConfig[$stopServices[$serviceIndex]] ($serviceIndex + 1) $stopServices.Count
-        }
 
         Write-StyledMessage Info '⏳ Attesa liberazione risorse...'
         Start-Sleep -Seconds 3
