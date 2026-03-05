@@ -280,9 +280,9 @@ function Invoke-WithSpinner {
                 }
 
                 # Clear any previous output and show progress bar
-                if (-not $Global:GuiSessionActive) {
+                if (-not $Global:GuiSessionActive)
                     Write-Host "`r" -NoNewline
-                }
+
                 Show-ProgressBar -Activity $Activity -Status "Esecuzione in corso... ($elapsed secondi)" -Percent $percent -Icon '⏳' -Spinner $spinner
                 Start-Sleep -Milliseconds $UpdateInterval
                 $result.Refresh()
