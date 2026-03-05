@@ -400,7 +400,10 @@ function WinOSCheck {
 
     Show-Header -SubTitle "System Check"
     $si = Get-SystemInfo
-    if (-not $si) { Write-StyledMessage -Type 'Warning' -Text "Info sistema non disponibili."; return }
+    if (-not $si) {
+        Write-StyledMessage -Type 'Warning' -Text "Info sistema non disponibili."
+        return
+    }
 
     Write-StyledMessage -Type 'Info' -Text "Sistema: $($si.ProductName) ($($si.DisplayVersion))"
 
