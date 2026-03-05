@@ -172,8 +172,13 @@ function Initialize-ToolLogging {
     param([string]$ToolName)
     $dateTime = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
     $logdir = $AppConfig.Paths.Logs
-    if (-not (Test-Path $logdir)) { $null = New-Item -Path $logdir -ItemType Directory -Force }
-    try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
+    if (-not (Test-Path $logdir))
+        $null = New-Item -Path $logdir -ItemType Directory -Force
+
+    try {
+        Stop-Transcript -ErrorAction SilentlyContinue
+    } catch {}
+
     Start-Transcript -Path "$logdir\${ToolName}_$dateTime.log" -Append -Force | Out-Null
 }
 
