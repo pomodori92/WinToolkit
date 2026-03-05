@@ -406,9 +406,8 @@ function Get-BitlockerStatus {
 
 function WinOSCheck {
     # Skip WinOSCheck if running in GUI mode to prevent duplicate output in job runspaces
-    if ($Global:GuiSessionActive) {
+    if ($Global:GuiSessionActive)
         return
-    }
 
     Show-Header -SubTitle "System Check"
     $si = Get-SystemInfo
