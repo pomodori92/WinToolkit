@@ -1031,11 +1031,8 @@ function WinUpdateReset {
             Write-StyledMessage Warning "Errore durante il reset del client Windows Update."
         }
 
-        Write-StyledMessage Info '🔧 Abilitazione Windows Update e servizi correlati...'
-
         # Restore Windows Update registry settings to defaults
-        Write-StyledMessage Info '📋 Ripristino impostazioni registro Windows Update...'
-
+        Write-StyledMessage Info '🔧 Abilitazione Windows Update e servizi correlati...`n📋 Ripristino impostazioni registro Windows Update...`n'
         try {
             If (!(Test-Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU")) {
                 New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Force | Out-Null
