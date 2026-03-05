@@ -418,9 +418,12 @@ function WinOSCheck {
 
     Write-StyledMessage -Type 'Info' -Text "Sistema: $($si.ProductName) ($($si.DisplayVersion))"
 
-    if ($si.BuildNumber -ge 22000) { Write-StyledMessage -Type 'Success' -Text "Sistema compatibile (Win11/10 recente)." }
-    elseif ($si.BuildNumber -ge 17763) { Write-StyledMessage -Type 'Success' -Text "Sistema compatibile (Win10)." }
-    elseif ($si.BuildNumber -eq 9600) { Write-StyledMessage -Type 'Warning' -Text "Windows 8.1: Compatibilità parziale." }
+    if ($si.BuildNumber -ge 22000)
+        Write-StyledMessage -Type 'Success' -Text "Sistema compatibile (Win11/10 recente)."
+    elseif ($si.BuildNumber -ge 17763)
+        Write-StyledMessage -Type 'Success' -Text "Sistema compatibile (Win10)."
+    elseif ($si.BuildNumber -eq 9600)
+        Write-StyledMessage -Type 'Warning' -Text "Windows 8.1: Compatibilità parziale."
     else {
         Write-StyledMessage -Type 'Error' -Text "$(Center-Text '🤣 ERRORE CRITICO 🤣' 65)"
         Write-StyledMessage -Type 'Error' -Text "Davvero pensi che questo script possa fare qualcosa per questa versione?"
