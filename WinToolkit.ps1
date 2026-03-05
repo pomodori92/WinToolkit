@@ -195,7 +195,8 @@ function Show-ProgressBar {
     # Only write to console if NOT in GUI session (to avoid interfering with job output)
     if (-not $Global:GuiSessionActive) {
         Write-Host "`r$Spinner $Icon $Activity $bar $Status" -NoNewline -ForegroundColor $Color
-        if ($Percent -ge 100) { Write-Host '' }
+        if ($Percent -ge 100)
+            Write-Host ''
     }
 }
 
