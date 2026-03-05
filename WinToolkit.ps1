@@ -1647,7 +1647,7 @@ function WinReinstallStore {
 
             Start-Sleep 2
             $testVersion = & winget --version *>$null
-            if ($LASTEXITCODE -eq 0) {
+            if ($LASTEXITCODE -eq 0)
                 Write-StyledMessage -Type 'Success' -Text "Database Winget ripristinato (versione: $testVersion)."
             else
                 Write-StyledMessage -Type 'Warning' -Text "Ripristino completato ma winget potrebbe non funzionare."
@@ -1677,9 +1677,9 @@ function WinReinstallStore {
 
             if ($exitCode -eq -1073741819 -or $exitCode -eq 3221225781) {
                 Write-StyledMessage -Type 'Warning' -Text "Crash rilevato (ExitCode: $exitCode = ACCESS_VIOLATION). Tentativo ripristino database..."
-                
+
                 $repairAttempt = Repair-WingetDatabase
-                
+
                 if ($repairAttempt) {
                     Write-StyledMessage -Type 'Info' -Text "Ripetizione test dopo ripristino..."
                     Start-Sleep 3
@@ -1714,7 +1714,9 @@ function WinReinstallStore {
         try {
             $latest = Invoke-RestMethod -Uri "https://api.github.com/repos/microsoft/winget-cli/releases/latest" -UseBasicParsing
             $asset = $latest.assets | Where-Object { $_.name -match $Match } | Select-Object -First 1
-            if ($asset) { return $asset.browser_download_url }
+            if ($asset)
+                return $asset.browser_download_url
+
             throw "Asset '$Match' non trovato."
         }
         catch {
