@@ -520,7 +520,6 @@ function WinRepairToolkit {
                         NoNewWindow            = $true
                         PassThru               = $true
                     }
-                    Start-Process @procParams
                 }
                 else {
                     $procParams = @{
@@ -531,8 +530,8 @@ function WinRepairToolkit {
                         NoNewWindow            = $true
                         PassThru               = $true
                     }
-                    Start-Process @procParams
                 }
+                Start-Process @procParams
             } -TimeoutSeconds $processTimeoutSeconds -UpdateInterval $spinnerUpdateInterval
 
             $results = @()
