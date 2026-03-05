@@ -994,9 +994,8 @@ function WinUpdateReset {
             Start-Sleep -Milliseconds 300
 
             $success = Remove-DirectorySafely -path $dir.Path -displayName $dir.Name
-            if (-not $success) {
+            if (-not $success)
                 Write-StyledMessage Info "💡 Suggerimento: Alcuni file potrebbero essere ricreati dopo il riavvio."
-            }
 
             $clearLine = "`r" + (' ' * ([Console]::WindowWidth - 1)) + "`r"
             Write-Host $clearLine -NoNewline
@@ -1010,9 +1009,8 @@ function WinUpdateReset {
 
         Write-StyledMessage Info '🚀 Avvio servizi essenziali...'
         $essentialServices = @('wuauserv', 'cryptsvc', 'bits')
-        for ($essentialIndex = 0; $essentialIndex -lt $essentialServices.Count; $essentialIndex++) {
+        for ($essentialIndex = 0; $essentialIndex -lt $essentialServices.Count; $essentialIndex++)
             Manage-Service $essentialServices[$essentialIndex] 'Start' $serviceConfig[$essentialServices[$essentialIndex]] ($essentialIndex + 1) $essentialServices.Count
-        }
 
         Write-StyledMessage Info '🔄 Reset del client Windows Update...'
         Write-Host '⚡ Esecuzione comando reset... ' -NoNewline -ForegroundColor Magenta
