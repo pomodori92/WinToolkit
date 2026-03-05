@@ -598,12 +598,13 @@ function WinRepairToolkit {
             # FIX: La variabile di successo deve richiedere che l'operazione non sia fallita/andata in timeout
             $success = $isSuccess -and ($errors.Count -eq 0)
 
-            if ($isTimeout) {
-                $message = "$($Config.Name) NON completato (interrotto per Timeout)."
-            }
-            else {
-                $message = "$($Config.Name) completato " + $(if ($success) { 'con successo' } else { "con $($errors.Count) errori" })
-            }
+            $message = if ($isTimeout) { "$($Config.Name) NON completato (interrotto per Timeout)." } `
+                else { `
+                    "$($Config.Name) completato " + `
+                    $(if ($success) { 'con successo' } `
+                    else { "con $($errors.Count) errori" `
+                    }) `
+                }
             Write-StyledMessage $(if ($success) { 'Success' } else { 'Warning' }) $message
 
             # Esportazione Log CBS di SFC
