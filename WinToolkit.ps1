@@ -1052,7 +1052,6 @@ function WinUpdateReset {
 
         # Reset WaaSMedicSvc registry settings to defaults
         Write-StyledMessage Info '🔧 Ripristino impostazioni WaaSMedicSvc...'
-
         try {
             Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\WaaSMedicSvc" -Name "Start" -Type DWord -Value 3 -ErrorAction SilentlyContinue
             Remove-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\WaaSMedicSvc" -Name "FailureActions" -ErrorAction SilentlyContinue
@@ -1064,7 +1063,6 @@ function WinUpdateReset {
 
         # Restore update services to their default state
         Write-StyledMessage Info '🔄 Ripristino servizi di update...'
-
         $services = @(
             @{Name = "BITS"; StartupType = "Manual"; Icon = "📡" },
             @{Name = "wuauserv"; StartupType = "Manual"; Icon = "🔄" },
@@ -1091,9 +1089,8 @@ function WinUpdateReset {
                     Start-Process @procParams | Out-Null
 
                     # Start the service if it should be running
-                    if ($service.StartupType -eq "Automatic") {
+                    if ($service.StartupType -eq "Automatic")
                         Start-Service -Name $service.Name -ErrorAction SilentlyContinue | Out-Null
-                    }
 
                     Write-StyledMessage Success "$($service.Icon) Servizio $($service.Name) ripristinato."
                 }
@@ -1102,12 +1099,10 @@ function WinUpdateReset {
                 Write-StyledMessage Warning "Avviso: Impossibile ripristinare servizio $($service.Name) - $($_.Exception.Message)"
             }
         }
-
         # Restore renamed DLLs if they exist
         Write-StyledMessage Info '🔍 Ripristino DLL rinominate...'
 
         $dlls = @("WaaSMedicSvc", "wuaueng")
-
         foreach ($dll in $dlls) {
             $dllPath = "C:\Windows\System32\$dll.dll"
             $backupPath = "C:\Windows\System32\${dll}_BAK.dll"
@@ -1167,7 +1162,6 @@ function WinUpdateReset {
                 Write-StyledMessage Warning "⚠️ $dll.dll non trovato e nessun backup disponibile."
             }
         }
-
         # Enable update related scheduled tasks
         Write-StyledMessage Info '📅 Riabilitazione task pianificati...'
 
@@ -1192,7 +1186,6 @@ function WinUpdateReset {
                 Write-StyledMessage Warning "Avviso: Impossibile abilitare task in $taskPath - $($_.Exception.Message)"
             }
         }
-
         # Enable driver offering through Windows Update
         Write-StyledMessage Info '🖨️ Abilitazione driver tramite Windows Update...'
 
@@ -1207,7 +1200,6 @@ function WinUpdateReset {
         catch {
             Write-StyledMessage Warning "Avviso: Impossibile abilitare driver - $($_.Exception.Message)"
         }
-
         # Enable Windows Update automatic restart
         Write-StyledMessage Info '🔄 Abilitazione riavvio automatico Windows Update...'
 
@@ -1219,7 +1211,6 @@ function WinUpdateReset {
         catch {
             Write-StyledMessage Warning "Avviso: Impossibile abilitare riavvio automatico - $($_.Exception.Message)"
         }
-
         # Reset Windows Update settings to default
         Write-StyledMessage Info '⚙️ Ripristino impostazioni Windows Update...'
 
@@ -1327,6 +1318,7 @@ function WinUpdateReset {
         try { Stop-Transcript | Out-Null } catch {}
     }
 }
+
 function WinReinstallStore {
     <#
     .SYNOPSIS
