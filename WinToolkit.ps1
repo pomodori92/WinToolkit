@@ -569,21 +569,24 @@ function WinRepairToolkit {
                 foreach ($line in ($results | Where-Object { $_ -and ![string]::IsNullOrWhiteSpace($_.Trim()) })) {
                     $trim = $line.Trim()
                     # Escludi linee di progresso, versione e messaggi informativi
-                    if ($trim -match '^\[=+\s*\d+' -or $trim -match '(?i)version:|deployment image') { continue }
+                    if ($trim -match '^\[=+\s*\d+' -or $trim -match '(?i)version:|deployment image')
+                        continue
 
                     # Per chkdsk, ignora messaggi informativi comuni che non sono errori critici
                     if ($isChkdsk) {
                         # Ignora messaggi informativi di chkdsk
-                        if ($trim -match '(?i)(stage|fase|percent complete|verificat|scanned|scanning|errors found.*corrected|volume label)') { continue }
+                        if ($trim -match '(?i)(stage|fase|percent complete|verificat|scanned|scanning|errors found.*corrected|volume label)')
+                            continue
                         # Solo errori critici per chkdsk
-                        if ($trim -match '(?i)(cannot|unable to|access denied|critical|fatal|corrupt file system|bad sectors)') {
+                        if ($trim -match '(?i)(cannot|unable to|access denied|critical|fatal|corrupt file system|bad sectors)')
                             $errors += $trim
-                        }
                     }
                     else {
                         # Logica normale per altri tool
-                        if ($trim -match '(?i)(errore|error|failed|impossibile|corrotto|corruption)') { $errors += $trim }
-                        elseif ($trim -match '(?i)(warning|avviso|attenzione)') { $warnings += $trim }
+                        if ($trim -match '(?i)(errore|error|failed|impossibile|corrotto|corruption)')
+                            $errors += $trim
+                        elseif ($trim -match '(?i)(warning|avviso|attenzione)')
+                            $warnings += $trim
                     }
                 }
 
