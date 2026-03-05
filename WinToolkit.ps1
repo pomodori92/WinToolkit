@@ -1377,14 +1377,15 @@ function WinReinstallStore {
 
         if ($Scope -eq 'User' -or $Scope -eq 'Both') {
             $userEnvPath = $env:PATH
-            if (($userEnvPath -split ';').Contains($PathToCheck)) { $pathExists = $true }
+            if (($userEnvPath -split ';').Contains($PathToCheck))
+                $pathExists = $true
         }
 
         if ($Scope -eq 'System' -or $Scope -eq 'Both') {
             $systemEnvPath = [System.Environment]::GetEnvironmentVariable('PATH', [System.EnvironmentVariableTarget]::Machine)
-            if (($systemEnvPath -split ';').Contains($PathToCheck)) { $pathExists = $true }
+            if (($systemEnvPath -split ';').Contains($PathToCheck))
+                $pathExists = $true
         }
-
         return $pathExists
     }
 
