@@ -141,9 +141,8 @@ function Show-Header {
     param([string]$SubTitle = "Menu Principale")
 
     # Skip header display if running in GUI mode to prevent console UI issues
-    if ($Global:GuiSessionActive) {
+    if ($Global:GuiSessionActive)
         return
-    }
 
     Clear-Host
     $width = $Host.UI.RawUI.BufferSize.Width
