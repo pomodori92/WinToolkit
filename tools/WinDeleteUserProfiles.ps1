@@ -87,7 +87,7 @@ function WinDeleteUserProfiles {
     function New-ProtectedNameSet {
         $excluded = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         $protectedProfileNames | ForEach-Object { [void]$excluded.Add($_) }
-        return ,$excluded
+        return , $excluded
     }
 
     function Remove-ProfileRegistryEntries {
@@ -99,19 +99,25 @@ function WinDeleteUserProfiles {
             [string]$UserName
         )
 
-        if ([string]::IsNullOrWhiteSpace($Sid) -or $Sid -eq 'NULL') { return $false }
+        if ([string]::IsNullOrWhiteSpace($Sid) -or $Sid -eq 'NULL') { 
+            return $false
+        }
 
         $profileRegKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\' + $Sid
 
-        if (-not (Test-Path -LiteralPath $profileRegKey)) { return $false }
+        if (-not (Test-Path -LiteralPath $profileRegKey)) {
+            return $true
+        }
 
         try {
             Remove-Item -LiteralPath $profileRegKey -Recurse -Force -ErrorAction Stop
             Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.registryEntryRemovedForSid01' -Args @($UserName, $Sid))
+            
             return $true
         }
         catch {
             Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.failedToRemoveRegistryEntryForSid01' -Args @($UserName, $($_.Exception.Message)))
+            
             return $false
         }
     }
@@ -124,24 +130,25 @@ function WinDeleteUserProfiles {
         }
         catch {
             Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.cimProfileDetectionFailed0' -Args @($($_.Exception.Message)))
-            return ,$pathSet
+            
+            return , $pathSet
         }
 
         $cimProfiles |
-            Where-Object {
-                $_.LocalPath -and
-                $_.LocalPath.StartsWith($usersRoot, [System.StringComparison]::OrdinalIgnoreCase)
-            } |
-            ForEach-Object {
-                try {
-                    [void]$pathSet.Add([System.IO.Path]::GetFullPath($_.LocalPath).TrimEnd('\'))
-                }
-                catch {
-                    Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.failedToNormalizeRegisteredProfileLocalpath0' -Args @($($_.LocalPath)))
-                }
+        Where-Object {
+            $_.LocalPath -and
+            $_.LocalPath.StartsWith($usersRoot, [System.StringComparison]::OrdinalIgnoreCase)
+        } |
+        ForEach-Object {
+            try {
+                [void]$pathSet.Add([System.IO.Path]::GetFullPath($_.LocalPath).TrimEnd('\'))
             }
+            catch {
+                Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.failedToNormalizeRegisteredProfileLocalpath0' -Args @($($_.LocalPath)))
+            }
+        }
 
-        return ,$pathSet
+        return , $pathSet
     }
 
     function Get-RemovableUserProfiles {
@@ -191,14 +198,85 @@ function WinDeleteUserProfiles {
         }
     }
 
+    function New-ProfileRemovalSessionState {
+        # Runspaces do not inherit the toolkit functions or the active language/log context.
+        $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+
+        foreach ($functionName in @(
+                'Get-SourceTextLoc',
+                'Write-ToolkitLog',
+                'Invoke-ExternalCommandWithLog',
+                'Remove-ItemSafely',
+                'Remove-ProfileRegistryEntries',
+                'Get-SpinnerChar'
+            )) {
+            $command = Get-Command -Name $functionName -CommandType Function -ErrorAction Stop
+            $sessionState.Commands.Add(
+                [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($functionName, $command.Definition)
+            )
+        }
+
+        # Only the parent runspace may update the shared console progress line.
+        foreach ($functionName in @('Clear-ProgressLine', 'Write-ProgressUpdate')) {
+            $sessionState.Commands.Add(
+                [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($functionName, '')
+            )
+        }
+
+        foreach ($variableName in @(
+                'SourceTextLanguageData',
+                'SourceTextDefaultLanguageData',
+                'SourceTextKeyAliases',
+                'CurrentLogFile',
+                'CurrentToolName',
+                'Spinners'
+            )) {
+            $value = Get-Variable -Name $variableName -Scope Global -ValueOnly -ErrorAction Stop
+            $sessionState.Variables.Add(
+                [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new($variableName, $value, '')
+            )
+        }
+        $sessionState.Variables.Add(
+            [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('GuiSessionActive', $true, '')
+        )
+
+        return $sessionState
+    }
+
+    function Receive-ProfileRemovalResult {
+        param(
+            [Parameter(Mandatory = $true)]
+            [object]$Job
+        )
+
+        try {
+            $Job.PowerShell.EndInvoke($Job.Handle)
+        }
+        catch {
+            Write-ToolkitLog -Level 'ERROR' -Message (Get-SourceTextLoc 'toolText.runspaceError0' -Args @($($_.Exception.Message)))
+            [PSCustomObject]@{
+                Type     = 'Profile'
+                UserName = [System.IO.Path]::GetFileName($Job.Profile.LocalPath)
+                Path     = $Job.Profile.LocalPath
+                Sid      = $Job.Profile.SID
+                Success  = $false
+                Duration = [TimeSpan]::Zero
+            }
+        }
+        finally {
+            $Job.PowerShell.Commands.Clear()
+            $Job.PowerShell.Dispose()
+        }
+    }
+
     function Invoke-ProfileRemovalBatch {
         param(
             [Parameter(Mandatory = $true)]
             [array]$Profiles
         )
 
-        $pool = [RunspaceFactory]::CreateRunspacePool(1, $maxThreadsEffective)
-        $pool.Open()
+        $sessionState = New-ProfileRemovalSessionState
+        $pool = [RunspaceFactory]::CreateRunspacePool(1, $maxThreadsEffective, $sessionState, $Host)
 
         $jobs = [System.Collections.Generic.List[object]]::new()
 
@@ -236,7 +314,7 @@ function WinDeleteUserProfiles {
                         -Arguments @("`"$tempEmpty`"", "`"$userPath`"", '/MIR', '/R:1', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP') `
                         -LogContextKey "ProfileCleanup-Robocopy-$userName" | Out-Null
 
-                    Remove-ItemSafely -Path $userPath -Recurse
+                    [void](Remove-ItemSafely -Path $userPath -Recurse)
 
                     Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.folderRemoved0' -Args @($userName))
                 }
@@ -246,7 +324,7 @@ function WinDeleteUserProfiles {
                     try {
                         Invoke-ExternalCommandWithLog -Command 'takeown.exe' -Arguments @('/F', "`"$userPath`"", '/R', '/D', 'Y') -LogContextKey "ProfileCleanup-TakeOwn-$userName" | Out-Null
                         Invoke-ExternalCommandWithLog -Command 'icacls.exe' -Arguments @("`"$userPath`"", '/grant', 'Administrators:F', '/T', '/C') -LogContextKey "ProfileCleanup-Icacls-$userName" | Out-Null
-                        Remove-ItemSafely -Path $userPath -Recurse
+                        [void](Remove-ItemSafely -Path $userPath -Recurse)
                         Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.folderRemovedAfterAclReset0' -Args @($userName))
                     }
                     catch {
@@ -256,11 +334,12 @@ function WinDeleteUserProfiles {
             }
 
             $folderGone = -not [System.IO.Directory]::Exists($userPath)
+            $registrySuccess = $cimSuccess
             if (-not $cimSuccess -and $folderGone -and $userSid) {
-                Remove-ProfileRegistryEntries -Sid $userSid -UserName $userName
+                $registrySuccess = Remove-ProfileRegistryEntries -Sid $userSid -UserName $userName
             }
 
-            $success = $folderGone
+            $success = $folderGone -and $registrySuccess
             $duration = New-TimeSpan -Start $start -End (Get-Date)
 
             if ($success) {
@@ -281,19 +360,21 @@ function WinDeleteUserProfiles {
         }
 
         try {
+            $pool.Open()
             foreach ($profile in $Profiles) {
                 $ps = [PowerShell]::Create()
                 $ps.RunspacePool = $pool
 
                 [void]$ps.AddScript($scriptBlock, $true).
-                    AddArgument($profile)
+                AddArgument($profile)
 
                 $handle = $ps.BeginInvoke()
 
                 $jobs.Add([PSCustomObject]@{
-                    PowerShell = $ps
-                    Handle     = $handle
-                })
+                        PowerShell = $ps
+                        Handle     = $handle
+                        Profile    = $profile
+                    })
             }
 
             $total = $jobs.Count
@@ -315,16 +396,7 @@ function WinDeleteUserProfiles {
             Clear-ProgressLine
 
             $results = foreach ($job in $jobs) {
-                try {
-                    $job.PowerShell.EndInvoke($job.Handle)
-                }
-                catch {
-                    Write-ToolkitLog -Level 'ERROR' -Message (Get-SourceTextLoc 'toolText.runspaceError0' -Args @($($_.Exception.Message)))
-                }
-                finally {
-                    $job.PowerShell.Commands.Clear()
-                    $job.PowerShell.Dispose()
-                }
+                Receive-ProfileRemovalResult -Job $job
             }
 
             return $results
@@ -345,9 +417,9 @@ function WinDeleteUserProfiles {
         Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.checkResidualFoldersInTheUsersDirectory')
 
         $folders = Get-ChildItem -Path $usersRoot -Directory -Force |
-            Where-Object {
-                -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)
-            }
+        Where-Object {
+            -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)
+        }
 
         $profileListKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
         $registeredSids = @()
@@ -422,7 +494,7 @@ function WinDeleteUserProfiles {
                 try {
                     Invoke-ExternalCommandWithLog -Command 'takeown.exe' -Arguments @('/F', "`"$folderPath`"", '/R', '/D', 'Y') -LogContextKey "ResidualTakeOwn-$($folder.Name)" | Out-Null
                     Invoke-ExternalCommandWithLog -Command 'icacls.exe' -Arguments @("`"$folderPath`"", '/grant', 'Administrators:F', '/T', '/C') -LogContextKey "ResidualIcacls-$($folder.Name)" | Out-Null
-                    Remove-ItemSafely -Path $folderPath -Recurse
+                    [void](Remove-ItemSafely -Path $folderPath -Recurse)
                     $success = -not [System.IO.Directory]::Exists($folderPath)
                 }
                 catch {
@@ -441,12 +513,12 @@ function WinDeleteUserProfiles {
             }
 
             $results.Add([PSCustomObject]@{
-                Type     = 'ResidualFolder'
-                UserName = $folder.Name
-                Path     = $folder.Path
-                Success  = $success
-                Duration = $duration
-            }) | Out-Null
+                    Type     = 'ResidualFolder'
+                    UserName = $folder.Name
+                    Path     = $folder.Path
+                    Success  = $success
+                    Duration = $duration
+                }) | Out-Null
         }
 
         Write-ProgressUpdate -Activity (Get-SourceTextLoc 'toolText.extra.removingResidualFoldersInCUsers') -Status (Get-SourceTextLoc 'uiText.completed') -Percent 100 -Icon '✅'
@@ -490,11 +562,11 @@ function WinDeleteUserProfiles {
             Write-Host ''
 
             $targets |
-                Select-Object @{Name='User'; Expression={ [System.IO.Path]::GetFileName($_.LocalPath) }},
-                                @{Name='Loaded'; Expression={ $_.Loaded }},
-                                @{Name='LastUseTime'; Expression={ $_.LastUseTime }},
-                                @{Name='Path'; Expression={ $_.LocalPath }} |
-                Format-Table -AutoSize
+            Select-Object @{Name = 'User'; Expression = { [System.IO.Path]::GetFileName($_.LocalPath) } },
+            @{Name = 'Loaded'; Expression = { $_.Loaded } },
+            @{Name = 'LastUseTime'; Expression = { $_.LastUseTime } },
+            @{Name = 'Path'; Expression = { $_.LocalPath } } |
+            Format-Table -AutoSize
 
             Write-Host ''
             Write-StyledMessage -Type 'Info' -Text ("🚀 " + (Get-SourceTextLoc 'toolText.startAutomaticRemovalOf0RegisteredProfiles' -Args @($targets.Count)))
