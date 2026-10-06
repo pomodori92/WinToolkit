@@ -4127,11 +4127,9 @@ function WinDeleteUserProfiles {
             $userSid = $Profile.SID
             $start = Get-Date
             Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.startResidualFolder01' -Args @($userName, $userPath))
-            $cimSuccess = $false
             try {
                 Remove-CimInstance -InputObject $Profile -ErrorAction Stop -Confirm:$false
                 Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.cimProfileRemoved0' -Args @($userName))
-                $cimSuccess = $true
             }
             catch {
                 Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.cimRemoveFailed01' -Args @($userName, $($_.Exception.Message)))
@@ -4143,17 +4141,17 @@ function WinDeleteUserProfiles {
                         New-Item -ItemType Directory -Path $tempEmpty | Out-Null
                     }
                     Invoke-ExternalCommandWithLog -Command 'robocopy.exe' `
-                        -Arguments @("`"$tempEmpty`"", "`"$userPath`"", '/MIR', '/R:1', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP') `
+                        -Arguments @("`"$tempEmpty`"", "`"$userPath`"", '/MIR', '/XJ', '/R:1', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP') `
                         -LogContextKey "ProfileCleanup-Robocopy-$userName" | Out-Null
-                    [void](Remove-ItemSafely -Path $userPath -Recurse)
+                    Remove-Item -LiteralPath $userPath -Recurse -Force -ErrorAction Stop -Confirm:$false
                     Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.folderRemoved0' -Args @($userName))
                 }
                 catch {
                     Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.standardFolderCleanupFailed01' -Args @($userName, $($_.Exception.Message)))
                     try {
                         Invoke-ExternalCommandWithLog -Command 'takeown.exe' -Arguments @('/F', "`"$userPath`"", '/R', '/D', 'Y') -LogContextKey "ProfileCleanup-TakeOwn-$userName" | Out-Null
-                        Invoke-ExternalCommandWithLog -Command 'icacls.exe' -Arguments @("`"$userPath`"", '/grant', 'Administrators:F', '/T', '/C') -LogContextKey "ProfileCleanup-Icacls-$userName" | Out-Null
-                        [void](Remove-ItemSafely -Path $userPath -Recurse)
+                        Invoke-ExternalCommandWithLog -Command 'icacls.exe' -Arguments @("`"$userPath`"", '/grant', '*S-1-5-32-544:F', '/T', '/C') -LogContextKey "ProfileCleanup-Icacls-$userName" | Out-Null
+                        Remove-Item -LiteralPath $userPath -Recurse -Force -ErrorAction Stop -Confirm:$false
                         Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.folderRemovedAfterAclReset0' -Args @($userName))
                     }
                     catch {
@@ -4162,8 +4160,8 @@ function WinDeleteUserProfiles {
                 }
             }
             $folderGone = -not [System.IO.Directory]::Exists($userPath)
-            $registrySuccess = $cimSuccess
-            if (-not $cimSuccess -and $folderGone -and $userSid) {
+            $registrySuccess = $false
+            if ($folderGone -and $userSid) {
                 $registrySuccess = Remove-ProfileRegistryEntries -Sid $userSid -UserName $userName
             }
             $success = $folderGone -and $registrySuccess
@@ -4288,8 +4286,8 @@ function WinDeleteUserProfiles {
                 Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.standardResidualFolderRemovalFailed01' -Args @($folderPath, $($_.Exception.Message)))
                 try {
                     Invoke-ExternalCommandWithLog -Command 'takeown.exe' -Arguments @('/F', "`"$folderPath`"", '/R', '/D', 'Y') -LogContextKey "ResidualTakeOwn-$($folder.Name)" | Out-Null
-                    Invoke-ExternalCommandWithLog -Command 'icacls.exe' -Arguments @("`"$folderPath`"", '/grant', 'Administrators:F', '/T', '/C') -LogContextKey "ResidualIcacls-$($folder.Name)" | Out-Null
-                    [void](Remove-ItemSafely -Path $folderPath -Recurse)
+                    Invoke-ExternalCommandWithLog -Command 'icacls.exe' -Arguments @("`"$folderPath`"", '/grant', '*S-1-5-32-544:F', '/T', '/C') -LogContextKey "ResidualIcacls-$($folder.Name)" | Out-Null
+                    Remove-Item -LiteralPath $folderPath -Recurse -Force -ErrorAction Stop -Confirm:$false
                     $success = -not [System.IO.Directory]::Exists($folderPath)
                 }
                 catch {

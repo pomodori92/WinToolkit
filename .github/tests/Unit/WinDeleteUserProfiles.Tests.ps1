@@ -1,10 +1,9 @@
 # WinToolkit CI/CD V4.2.0
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 <#
-Regression coverage for issue #189 without running profile deletion.
+Regression coverage for issue #189 without deleting Windows profiles.
 Loads individual function definitions from the AST, never the tool or toolkit scripts.
-Only initialization, localization, logging, and result collection are invoked.
-Removal helpers are registered as text and inspected, never called.
+Deletion commands are mocked; folder removal tests use empty TestDrive directories.
 #>
 param([string]$CompiledScriptPath)
 
@@ -21,11 +20,14 @@ Describe 'Issue #189 safe regressions' {
             @{ Path = $toolPath; Name = 'New-ProfileRemovalSessionState' },
             @{ Path = $toolPath; Name = 'Receive-ProfileRemovalResult' },
             @{ Path = $toolPath; Name = 'Remove-ProfileRegistryEntries' },
+            @{ Path = $toolPath; Name = 'Remove-ResidualUserFolders' },
             @{ Path = $localizationPath; Name = 'Get-SourceTextLoc' },
             @{ Path = $loggingPath; Name = 'Write-ToolkitLog' },
             @{ Path = $processesPath; Name = 'Invoke-ExternalCommandWithLog' },
             @{ Path = $processesPath; Name = 'Remove-ItemSafely' },
-            @{ Path = $uiPath; Name = 'Get-SpinnerChar' }
+            @{ Path = $uiPath; Name = 'Get-SpinnerChar' },
+            @{ Path = $uiPath; Name = 'Clear-ProgressLine' },
+            @{ Path = $uiPath; Name = 'Write-ProgressUpdate' }
         )
         foreach ($definition in $definitions) {
             $path = if ($CompiledScriptPath) { $CompiledScriptPath } else { $definition.Path }
@@ -39,6 +41,22 @@ Describe 'Issue #189 safe regressions' {
             if (-not $function) { throw "Missing helper $($definition.Name) in $path" }
             . ([scriptblock]::Create($function.Extent.Text))
         }
+
+        $workerSourcePath = if ($CompiledScriptPath) { $CompiledScriptPath } else { $toolPath }
+        $toolAst = [System.Management.Automation.Language.Parser]::ParseFile($workerSourcePath, [ref]$null, [ref]$null)
+        $batchFunction = $toolAst.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-ProfileRemovalBatch'
+        }, $true)
+        $workerAssignment = $batchFunction.Body.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$scriptBlock'
+        }, $true)
+        $workerExpression = $workerAssignment.Right.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.ScriptBlockExpressionAst]
+        }, $true)
+        $script:ProfileRemovalWorker = $workerExpression.ScriptBlock.GetScriptBlock()
 
         Import-LocalizedData -BindingVariable italianData -BaseDirectory (Join-Path $script:RepoRoot 'languages') -FileName 'WinToolkit.psd1' -UICulture 'it-IT'
         Import-LocalizedData -BindingVariable englishData -BaseDirectory (Join-Path $script:RepoRoot 'languages') -FileName 'WinToolkit.psd1' -UICulture 'en-US'
@@ -198,6 +216,110 @@ Describe 'Issue #189 safe regressions' {
             $results.Count | Should -Be 1
             $results[0].Type | Should -Be 'Profile'
             $results[0].Success | Should -Be $Success
+        }
+    }
+
+    Context 'Folder removal failures with mocked Windows operations' {
+        BeforeEach {
+            $script:ProbeFolderPath = Join-Path $TestDrive 'Issue189[Probe]'
+            [void][System.IO.Directory]::CreateDirectory($script:ProbeFolderPath)
+            $script:ProbeProfile = [pscustomobject]@{
+                LocalPath = $script:ProbeFolderPath
+                SID = 'S-1-5-21-189-1'
+            }
+            $script:RemovalAttempts = 0
+            Mock Remove-CimInstance { throw 'Synthetic CIM removal failure' }
+            Mock Remove-ProfileRegistryEntries { $true }
+            Mock Invoke-ExternalCommandWithLog { [pscustomobject]@{ Success = $true; ExitCode = 0 } }
+            Mock Remove-ItemSafely { $false }
+            Mock Test-Path { $true } -ParameterFilter { $Path -eq (Join-Path $env:TEMP 'EmptyFolder') }
+            Mock Clear-ProgressLine {}
+            Mock Write-ProgressUpdate {}
+        }
+
+        It 'recovers with ACL reset when the first literal folder removal fails' {
+            Mock Remove-Item {
+                $script:RemovalAttempts++
+                if ($script:RemovalAttempts -eq 1) { throw 'Synthetic access denied' }
+                if ($LiteralPath -ne $script:ProbeFolderPath) { throw 'Unexpected deletion target' }
+                [System.IO.Directory]::Delete($LiteralPath)
+            }
+
+            $result = & $script:ProfileRemovalWorker $script:ProbeProfile
+
+            $result.Success | Should -BeTrue
+            [System.IO.Directory]::Exists($script:ProbeFolderPath) | Should -BeFalse
+            Should -Invoke Remove-Item -Times 2 -Exactly -ParameterFilter {
+                $LiteralPath -eq $script:ProbeFolderPath -and $Recurse -and $Force -and $ErrorAction -eq 'Stop'
+            }
+            Should -Invoke Invoke-ExternalCommandWithLog -Times 1 -Exactly -ParameterFilter { $Command -eq 'takeown.exe' }
+            Should -Invoke Invoke-ExternalCommandWithLog -Times 1 -Exactly -ParameterFilter {
+                $Command -eq 'robocopy.exe' -and $Arguments -contains '/XJ'
+            }
+            Should -Invoke Invoke-ExternalCommandWithLog -Times 1 -Exactly -ParameterFilter {
+                $Command -eq 'icacls.exe' -and $Arguments -contains '*S-1-5-32-544:F'
+            }
+            Should -Invoke Remove-ProfileRegistryEntries -Times 1 -Exactly -ParameterFilter { $Sid -eq $script:ProbeProfile.SID }
+            Should -Invoke Remove-ItemSafely -Times 0 -Exactly
+        }
+
+        It 'reports failure and preserves the registry when both folder removal attempts fail' {
+            Mock Remove-Item { throw 'Synthetic access denied' }
+
+            $result = & $script:ProfileRemovalWorker $script:ProbeProfile
+
+            $result.Success | Should -BeFalse
+            [System.IO.Directory]::Exists($script:ProbeFolderPath) | Should -BeTrue
+            Should -Invoke Remove-Item -Times 2 -Exactly
+            Should -Invoke Remove-ProfileRegistryEntries -Times 0 -Exactly
+            Get-Content -LiteralPath $Global:CurrentLogFile -Raw | Should -Match '\[ERROR\].*Synthetic access denied'
+        }
+
+        It 'checks the remaining registry entry even when CIM reported success' {
+            Mock Remove-CimInstance {}
+            Mock Remove-ProfileRegistryEntries { $false }
+            Mock Remove-Item {
+                if ($LiteralPath -ne $script:ProbeFolderPath) { throw 'Unexpected deletion target' }
+                [System.IO.Directory]::Delete($LiteralPath)
+            }
+
+            $result = & $script:ProfileRemovalWorker $script:ProbeProfile
+
+            $result.Success | Should -BeFalse
+            [System.IO.Directory]::Exists($script:ProbeFolderPath) | Should -BeFalse
+            Should -Invoke Remove-ProfileRegistryEntries -Times 1 -Exactly
+        }
+
+        It 'retries a residual folder using its literal path after ACL reset' {
+            Mock Remove-Item {
+                $script:RemovalAttempts++
+                if ($script:RemovalAttempts -eq 1) { throw 'Synthetic access denied' }
+                if ($LiteralPath -ne $script:ProbeFolderPath) { throw 'Unexpected deletion target' }
+                [System.IO.Directory]::Delete($LiteralPath)
+            }
+            $folder = [pscustomobject]@{ Name = 'Issue189[Probe]'; Path = $script:ProbeFolderPath }
+
+            $result = Remove-ResidualUserFolders -Folders @($folder)
+
+            $result.Success | Should -BeTrue
+            Should -Invoke Remove-Item -Times 2 -Exactly -ParameterFilter {
+                $LiteralPath -eq $script:ProbeFolderPath -and $Recurse -and $Force -and $ErrorAction -eq 'Stop'
+            }
+            Should -Invoke Invoke-ExternalCommandWithLog -Times 1 -Exactly -ParameterFilter {
+                $Command -eq 'icacls.exe' -and $Arguments -contains '*S-1-5-32-544:F'
+            }
+        }
+
+        It 'reports a residual folder failure when ACL recovery cannot remove it' {
+            Mock Remove-Item { throw 'Synthetic access denied' }
+            $folder = [pscustomobject]@{ Name = 'Issue189[Probe]'; Path = $script:ProbeFolderPath }
+
+            $result = Remove-ResidualUserFolders -Folders @($folder)
+
+            $result.Success | Should -BeFalse
+            [System.IO.Directory]::Exists($script:ProbeFolderPath) | Should -BeTrue
+            Should -Invoke Remove-Item -Times 2 -Exactly
+            Get-Content -LiteralPath $Global:CurrentLogFile -Raw | Should -Match '\[ERROR\].*Synthetic access denied'
         }
     }
 
