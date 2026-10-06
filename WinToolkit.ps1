@@ -4029,24 +4029,24 @@ function WinDeleteUserProfiles {
             $_.LocalPath -and
             $_.LocalPath.StartsWith($usersRoot, [System.StringComparison]::OrdinalIgnoreCase)
         }
-        foreach ($profile in $profiles) {
-            $profileName = [System.IO.Path]::GetFileName($profile.LocalPath)
+        foreach ($profileItem in $profiles) {
+            $profileName = [System.IO.Path]::GetFileName($profileItem.LocalPath)
             if ($excluded.Contains($profileName)) {
-                Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.excludedProfile01' -Args @($profileName, $($profile.LocalPath)))
+                Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.excludedProfile01' -Args @($profileName, $($profileItem.LocalPath)))
                 continue
             }
-            if ($profile.SID -eq $currentUserSid) {
-                Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.excludedProfileBecauseSidMatchesCurrentUser0' -Args @($profileName, $profile.SID))
+            if ($profileItem.SID -eq $currentUserSid) {
+                Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.excludedProfileBecauseSidMatchesCurrentUser0' -Args @($profileName, $profileItem.SID))
                 continue
             }
-            if ($minimumLastUseDate -and $profile.LastUseTime) {
-                $lastUse = $profile.LastUseTime
+            if ($minimumLastUseDate -and $profileItem.LastUseTime) {
+                $lastUse = $profileItem.LastUseTime
                 if ($lastUse -gt $minimumLastUseDate) {
                     Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.profileExcludedDueToTimeThreshold0LastUse1' -Args @($profileName, $lastUse))
                     continue
                 }
             }
-            $profile
+            $profileItem
         }
     }
     function New-ProfileRemovalSessionState {
@@ -4120,15 +4120,15 @@ function WinDeleteUserProfiles {
         $pool = [RunspaceFactory]::CreateRunspacePool(1, $maxThreadsEffective, $sessionState, $Host)
         $jobs = [System.Collections.Generic.List[object]]::new()
         $scriptBlock = {
-            param($Profile)
+            param($ProfileItem)
             $ErrorActionPreference = 'Stop'
-            $userPath = $Profile.LocalPath
+            $userPath = $ProfileItem.LocalPath
             $userName = [System.IO.Path]::GetFileName($userPath)
-            $userSid = $Profile.SID
+            $userSid = $ProfileItem.SID
             $start = Get-Date
             Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.startResidualFolder01' -Args @($userName, $userPath))
             try {
-                Remove-CimInstance -InputObject $Profile -ErrorAction Stop -Confirm:$false
+                Remove-CimInstance -InputObject $ProfileItem -ErrorAction Stop -Confirm:$false
                 Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.cimProfileRemoved0' -Args @($userName))
             }
             catch {
@@ -4183,16 +4183,16 @@ function WinDeleteUserProfiles {
         }
         try {
             $pool.Open()
-            foreach ($profile in $Profiles) {
+            foreach ($profileItem in $Profiles) {
                 $ps = [PowerShell]::Create()
                 $ps.RunspacePool = $pool
                 [void]$ps.AddScript($scriptBlock, $true).
-                AddArgument($profile)
+                AddArgument($profileItem)
                 $handle = $ps.BeginInvoke()
                 $jobs.Add([PSCustomObject]@{
                         PowerShell = $ps
                         Handle     = $handle
-                        Profile    = $profile
+                        Profile    = $profileItem
                     })
             }
             $total = $jobs.Count
