@@ -321,6 +321,7 @@ function WinDeleteUserProfiles {
 
                     try {
                         Invoke-ExternalCommandWithLog -Command 'takeown.exe' -Arguments @('/F', "`"$userPath`"", '/R', '/D', 'Y') -LogContextKey "ProfileCleanup-TakeOwn-$userName" | Out-Null
+                        # S-1-5-32-544 - Fixed SID across Windows languages; avoids depending on localized group names.
                         Invoke-ExternalCommandWithLog -Command 'icacls.exe' -Arguments @("`"$userPath`"", '/grant', '*S-1-5-32-544:F', '/T', '/C') -LogContextKey "ProfileCleanup-Icacls-$userName" | Out-Null
                         Remove-Item -LiteralPath $userPath -Recurse -Force -ErrorAction Stop -Confirm:$false
                         Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.folderRemovedAfterAclReset0' -Args @($userName))
@@ -491,6 +492,7 @@ function WinDeleteUserProfiles {
 
                 try {
                     Invoke-ExternalCommandWithLog -Command 'takeown.exe' -Arguments @('/F', "`"$folderPath`"", '/R', '/D', 'Y') -LogContextKey "ResidualTakeOwn-$($folder.Name)" | Out-Null
+                    # S-1-5-32-544 - Fixed SID across Windows languages; avoids depending on localized group names.
                     Invoke-ExternalCommandWithLog -Command 'icacls.exe' -Arguments @("`"$folderPath`"", '/grant', '*S-1-5-32-544:F', '/T', '/C') -LogContextKey "ResidualIcacls-$($folder.Name)" | Out-Null
                     Remove-Item -LiteralPath $folderPath -Recurse -Force -ErrorAction Stop -Confirm:$false
                     $success = -not [System.IO.Directory]::Exists($folderPath)
