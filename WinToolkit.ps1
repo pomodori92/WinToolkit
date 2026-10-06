@@ -4111,6 +4111,27 @@ function WinDeleteUserProfiles {
             $Job.PowerShell.Dispose()
         }
     }
+    function Close-ProfileRemovalPowerShell {
+        param(
+            [Parameter(Mandatory = $true)]
+            [object]$PowerShell
+        )
+        try {
+            $PowerShell.Stop()
+        }
+        catch [System.ObjectDisposedException] {}
+        catch {
+            Write-Warning -Message $_.Exception.Message -WarningAction Continue
+        }
+        finally {
+            try {
+                $PowerShell.Dispose()
+            }
+            catch {
+                Write-Warning -Message $_.Exception.Message -WarningAction Continue
+            }
+        }
+    }
     function Invoke-ProfileRemovalBatch {
         param(
             [Parameter(Mandatory = $true)]
@@ -4119,6 +4140,7 @@ function WinDeleteUserProfiles {
         $sessionState = New-ProfileRemovalSessionState
         $pool = [RunspaceFactory]::CreateRunspacePool(1, $maxThreadsEffective, $sessionState, $Host)
         $jobs = [System.Collections.Generic.List[object]]::new()
+        $pendingPowerShell = $null
         $scriptBlock = {
             param($ProfileItem)
             $ErrorActionPreference = 'Stop'
@@ -4199,6 +4221,7 @@ function WinDeleteUserProfiles {
                 while ($nextProfileIndex -lt $total -and $jobs.Count -lt $maxThreadsEffective) {
                     $profileItem = $Profiles[$nextProfileIndex]
                     $ps = [PowerShell]::Create()
+                    $pendingPowerShell = $ps
                     $ps.RunspacePool = $pool
                     [void]$ps.AddScript($scriptBlock, $true).
                     AddArgument($profileItem)
@@ -4209,6 +4232,7 @@ function WinDeleteUserProfiles {
                             Profile    = $profileItem
                             Index      = $nextProfileIndex
                         })
+                    $pendingPowerShell = $null
                     $nextProfileIndex++
                 }
                 $percent = if ($total -gt 0) { [math]::Floor(($completed / $total) * 100) } else { 100 }
@@ -4226,9 +4250,20 @@ function WinDeleteUserProfiles {
             return $results
         }
         finally {
-            if ($pool) {
-                $pool.Close()
-                $pool.Dispose()
+            try {
+                if ($pendingPowerShell) {
+                    Close-ProfileRemovalPowerShell -PowerShell $pendingPowerShell
+                }
+                foreach ($job in $jobs) {
+                    Close-ProfileRemovalPowerShell -PowerShell $job.PowerShell
+                }
+                $jobs.Clear()
+            }
+            finally {
+                if ($pool) {
+                    try { $pool.Close() }
+                    finally { $pool.Dispose() }
+                }
             }
         }
     }
