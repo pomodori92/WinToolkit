@@ -360,27 +360,41 @@ function WinDeleteUserProfiles {
 
         try {
             $pool.Open()
-            foreach ($profileItem in $Profiles) {
-                $ps = [PowerShell]::Create()
-                $ps.RunspacePool = $pool
-
-                [void]$ps.AddScript($scriptBlock, $true).
-                AddArgument($profileItem)
-
-                $handle = $ps.BeginInvoke()
-
-                $jobs.Add([PSCustomObject]@{
-                        PowerShell = $ps
-                        Handle     = $handle
-                        Profile    = $profileItem
-                    })
-            }
-
-            $total = $jobs.Count
+            $total = $Profiles.Count
+            $results = [object[]]::new($total)
+            $nextProfileIndex = 0
+            $completed = 0
             $lastPercent = -1
 
             do {
-                $completed = ($jobs | Where-Object { $_.Handle.IsCompleted }).Count
+                for ($jobIndex = $jobs.Count - 1; $jobIndex -ge 0; $jobIndex--) {
+                    $job = $jobs[$jobIndex]
+                    if (-not $job.Handle.IsCompleted) { continue }
+
+                    $results[$job.Index] = Receive-ProfileRemovalResult -Job $job
+                    $jobs.RemoveAt($jobIndex)
+                    $completed++
+                }
+
+                while ($nextProfileIndex -lt $total -and $jobs.Count -lt $maxThreadsEffective) {
+                    $profileItem = $Profiles[$nextProfileIndex]
+                    $ps = [PowerShell]::Create()
+                    $ps.RunspacePool = $pool
+
+                    [void]$ps.AddScript($scriptBlock, $true).
+                    AddArgument($profileItem)
+
+                    $handle = $ps.BeginInvoke()
+
+                    $jobs.Add([PSCustomObject]@{
+                            PowerShell = $ps
+                            Handle     = $handle
+                            Profile    = $profileItem
+                            Index      = $nextProfileIndex
+                        })
+                    $nextProfileIndex++
+                }
+
                 $percent = if ($total -gt 0) { [math]::Floor(($completed / $total) * 100) } else { 100 }
 
                 if ($percent -ne $lastPercent) {
@@ -388,15 +402,14 @@ function WinDeleteUserProfiles {
                     Write-ProgressUpdate -Activity (Get-SourceTextLoc 'toolText.extra.removingRegisteredProfiles') -Status (Get-SourceTextLoc 'toolText.extra.01Completed' -Args @($completed, $total)) -Percent $percent -Icon '🗑️'
                 }
 
-                Start-Sleep -Milliseconds 500
+                if ($jobs.Count -gt 0) {
+                    $waitHandles = [System.Threading.WaitHandle[]]@($jobs | ForEach-Object { $_.Handle.AsyncWaitHandle })
+                    [void][System.Threading.WaitHandle]::WaitAny($waitHandles, 500)
+                }
             } while ($completed -lt $total)
 
             Write-ProgressUpdate -Activity (Get-SourceTextLoc 'toolText.extra.removingRegisteredProfiles') -Status (Get-SourceTextLoc 'uiText.completed') -Percent 100 -Icon '✅'
             Clear-ProgressLine
-
-            $results = foreach ($job in $jobs) {
-                Receive-ProfileRemovalResult -Job $job
-            }
 
             return $results
         }

@@ -57,6 +57,10 @@ Describe 'Issue #189 safe regressions' {
             $node -is [System.Management.Automation.Language.ScriptBlockExpressionAst]
         }, $true)
         $script:ProfileRemovalWorker = $workerExpression.ScriptBlock.GetScriptBlock()
+        $script:ProfileRemovalBatchDefinition = $batchFunction.Extent.Text
+        $script:ProfileRemovalWorkerOffset = $workerAssignment.Extent.StartOffset - $batchFunction.Extent.StartOffset
+        $script:ProfileRemovalWorkerLength = $workerAssignment.Extent.EndOffset - $workerAssignment.Extent.StartOffset
+        $script:ProfileBatchResultReceiver = (Get-Command Receive-ProfileRemovalResult).ScriptBlock
 
         Import-LocalizedData -BindingVariable italianData -BaseDirectory (Join-Path $script:RepoRoot 'languages') -FileName 'WinToolkit.psd1' -UICulture 'it-IT'
         Import-LocalizedData -BindingVariable englishData -BaseDirectory (Join-Path $script:RepoRoot 'languages') -FileName 'WinToolkit.psd1' -UICulture 'en-US'
@@ -343,6 +347,122 @@ Describe 'Issue #189 safe regressions' {
         It 'prints both Italian zero counts in the cleanup summary' {
             Get-SourceTextLoc 'toolText.registeredProfilesRemoved0' -Args @(0) | Should -Be 'Profili registrati rimossi: 0'
             Get-SourceTextLoc 'toolText.residualFoldersRemoved0' -Args @(0) | Should -Be 'Cartelle residue rimosse: 0'
+        }
+    }
+
+    Context 'Bounded profile scheduling with synthetic workers' {
+        BeforeAll {
+            $syntheticWorker = @'
+$scriptBlock = {
+    param($ProfileItem)
+    Start-Sleep -Milliseconds $ProfileItem.DelayMilliseconds
+    if ($ProfileItem.Fail) { throw 'Synthetic bounded-worker failure' }
+    [pscustomobject]@{
+        Type = 'Profile'
+        UserName = $ProfileItem.Name
+        Success = $true
+        Duration = [TimeSpan]::Zero
+    }
+}
+'@
+            $probeSource = $script:ProfileRemovalBatchDefinition.Remove(
+                $script:ProfileRemovalWorkerOffset, $script:ProfileRemovalWorkerLength
+            ).Insert($script:ProfileRemovalWorkerOffset, $syntheticWorker)
+            $probeSource = $probeSource.Replace('$ps = [PowerShell]::Create()', '$ps = New-TrackedProfilePowerShell')
+            if ($probeSource -match '\b(Remove-CimInstance|Remove-Item|Invoke-ExternalCommandWithLog)\b') {
+                throw 'A destructive command remained in the scheduling probe.'
+            }
+            . ([scriptblock]::Create($probeSource))
+
+            function New-TrackedProfilePowerShell {
+                $outstanding = $script:BatchCreatedPowerShells.Count - $script:BatchCollectedCount + 1
+                $script:BatchPeakOutstanding = [Math]::Max($script:BatchPeakOutstanding, $outstanding)
+                $powerShell = [PowerShell]::Create()
+                $script:BatchCreatedPowerShells.Add($powerShell)
+                return $powerShell
+            }
+        }
+
+        BeforeEach {
+            $script:BatchCreatedPowerShells = [System.Collections.Generic.List[object]]::new()
+            $script:BatchCollectedCount = 0
+            $script:BatchPeakOutstanding = 0
+            $script:BatchReceivedNames = [System.Collections.Generic.List[string]]::new()
+            $script:BatchProgress = [System.Collections.Generic.List[int]]::new()
+            Mock New-ProfileRemovalSessionState { [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault() }
+            Mock Write-ProgressUpdate { $script:BatchProgress.Add($Percent) }
+            Mock Clear-ProgressLine {}
+            Mock Receive-ProfileRemovalResult {
+                $script:BatchReceivedNames.Add([System.IO.Path]::GetFileName($Job.Profile.LocalPath))
+                $result = & $script:ProfileBatchResultReceiver -Job $Job
+                $script:BatchCollectedCount++
+                $result
+            }
+        }
+
+        AfterEach {
+            foreach ($powerShell in $script:BatchCreatedPowerShells) { $powerShell.Dispose() }
+        }
+
+        It 'limits <Count> profiles to <Threads> outstanding jobs and preserves every result' -ForEach @(
+            @{ Count = 3; Threads = 1 },
+            @{ Count = 32; Threads = 2 },
+            @{ Count = 256; Threads = 4 }
+        ) {
+            $maxThreadsEffective = $Threads
+            $profiles = @(for ($index = 0; $index -lt $Count; $index++) {
+                [pscustomobject]@{
+                    Name = "Synthetic$index"
+                    LocalPath = "C:\Users\Synthetic$index"
+                    SID = "S-1-5-21-189-$index"
+                    DelayMilliseconds = 1
+                    Fail = $false
+                }
+            })
+
+            $results = @(Invoke-ProfileRemovalBatch -Profiles $profiles)
+
+            $script:BatchPeakOutstanding | Should -BeLessOrEqual $Threads
+            $script:BatchCreatedPowerShells.Count | Should -Be $Count
+            $script:BatchCollectedCount | Should -Be $Count
+            $results.Count | Should -Be $Count
+            @($results | Where-Object { -not $_.Success }).Count | Should -Be 0
+            for ($index = 0; $index -lt $Count; $index++) {
+                $results[$index].UserName | Should -Be $profiles[$index].Name
+            }
+            $script:BatchProgress[-1] | Should -Be 100
+        }
+
+        It 'returns input order when a later worker finishes first' {
+            $maxThreadsEffective = 2
+            $profiles = @(
+                [pscustomobject]@{ Name = 'Slow'; LocalPath = 'C:\Users\Slow'; SID = 'slow'; DelayMilliseconds = 250; Fail = $false },
+                [pscustomobject]@{ Name = 'Fast'; LocalPath = 'C:\Users\Fast'; SID = 'fast'; DelayMilliseconds = 1; Fail = $false }
+            )
+
+            $results = @(Invoke-ProfileRemovalBatch -Profiles $profiles)
+
+            $script:BatchReceivedNames[0] | Should -Be 'Fast'
+            $results[0].UserName | Should -Be 'Slow'
+            $results[1].UserName | Should -Be 'Fast'
+        }
+
+        It 'retains one failed result while scheduling replacements' {
+            $maxThreadsEffective = 1
+            $profiles = @(
+                [pscustomobject]@{ Name = 'Failed'; LocalPath = 'C:\Users\Failed'; SID = 'failed'; DelayMilliseconds = 1; Fail = $true },
+                [pscustomobject]@{ Name = 'Next'; LocalPath = 'C:\Users\Next'; SID = 'next'; DelayMilliseconds = 1; Fail = $false }
+            )
+
+            $results = @(Invoke-ProfileRemovalBatch -Profiles $profiles)
+
+            $script:BatchPeakOutstanding | Should -Be 1
+            $results.Count | Should -Be 2
+            $results[0].UserName | Should -Be 'Failed'
+            $results[0].Success | Should -BeFalse
+            $results[1].UserName | Should -Be 'Next'
+            $results[1].Success | Should -BeTrue
+            $script:BatchCollectedCount | Should -Be 2
         }
     }
 }
