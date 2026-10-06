@@ -21,6 +21,7 @@ Describe 'Issue #189 safe regressions' {
             @{ Path = $toolPath; Name = 'Receive-ProfileRemovalResult' },
             @{ Path = $toolPath; Name = 'Close-ProfileRemovalPowerShell' },
             @{ Path = $toolPath; Name = 'Remove-ProfileRegistryEntries' },
+            @{ Path = $toolPath; Name = 'Remove-ResidualUserFolder' },
             @{ Path = $toolPath; Name = 'Remove-ResidualUserFolders' },
             @{ Path = $localizationPath; Name = 'Get-SourceTextLoc' },
             @{ Path = $loggingPath; Name = 'Write-ToolkitLog' },
@@ -62,6 +63,19 @@ Describe 'Issue #189 safe regressions' {
         $script:ProfileRemovalWorkerOffset = $workerAssignment.Extent.StartOffset - $batchFunction.Extent.StartOffset
         $script:ProfileRemovalWorkerLength = $workerAssignment.Extent.EndOffset - $workerAssignment.Extent.StartOffset
         $script:ProfileBatchResultReceiver = (Get-Command Receive-ProfileRemovalResult).ScriptBlock
+        $script:ResidualSessionStateFactory = (Get-Command New-ProfileRemovalSessionState).ScriptBlock
+        $residualBatchFunction = $toolAst.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Remove-ResidualUserFolders'
+        }, $true)
+        $residualWorkerAssignment = $residualBatchFunction.Body.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$scriptBlock'
+        }, $true)
+        $script:ResidualRemovalBatchDefinition = $residualBatchFunction.Extent.Text
+        $script:ResidualRemovalBatchInvoker = (Get-Command Remove-ResidualUserFolders).ScriptBlock
+        $script:ResidualRemovalWorkerOffset = $residualWorkerAssignment.Extent.StartOffset - $residualBatchFunction.Extent.StartOffset
+        $script:ResidualRemovalWorkerLength = $residualWorkerAssignment.Extent.EndOffset - $residualWorkerAssignment.Extent.StartOffset
 
         Import-LocalizedData -BindingVariable italianData -BaseDirectory (Join-Path $script:RepoRoot 'languages') -FileName 'WinToolkit.psd1' -UICulture 'it-IT'
         Import-LocalizedData -BindingVariable englishData -BaseDirectory (Join-Path $script:RepoRoot 'languages') -FileName 'WinToolkit.psd1' -UICulture 'en-US'
@@ -136,7 +150,7 @@ Describe 'Issue #189 safe regressions' {
                     ToolName = $Global:CurrentToolName
                     Helpers = @(
                         'Get-SourceTextLoc', 'Write-ToolkitLog', 'Invoke-ExternalCommandWithLog',
-                        'Remove-ItemSafely', 'Remove-ProfileRegistryEntries', 'Get-SpinnerChar',
+                        'Remove-ItemSafely', 'Remove-ProfileRegistryEntries', 'Remove-ResidualUserFolder', 'Get-SpinnerChar',
                         'Clear-ProgressLine', 'Write-ProgressUpdate'
                     ) | ForEach-Object { (Get-Command -Name $_ -CommandType Function -ErrorAction Stop).Name }
                 }
@@ -147,7 +161,7 @@ Describe 'Issue #189 safe regressions' {
                 $result.Message | Should -Be 'Profili registrati rimossi: 0'
                 $result.LogPath | Should -Be $Global:CurrentLogFile
                 $result.ToolName | Should -Be 'Issue189Probe'
-                $result.Helpers.Count | Should -Be 8
+                $result.Helpers.Count | Should -Be 9
             }
             $logLines = @(Get-Content -LiteralPath $Global:CurrentLogFile | Where-Object { $_ -match '\[INFO\]' })
             $logLines.Count | Should -Be 4
@@ -304,7 +318,7 @@ Describe 'Issue #189 safe regressions' {
             }
             $folder = [pscustomobject]@{ Name = 'Issue189[Probe]'; Path = $script:ProbeFolderPath }
 
-            $result = Remove-ResidualUserFolders -Folders @($folder)
+            $result = Remove-ResidualUserFolder -Folder $folder
 
             $result.Success | Should -BeTrue
             Should -Invoke Remove-Item -Times 2 -Exactly -ParameterFilter {
@@ -319,7 +333,7 @@ Describe 'Issue #189 safe regressions' {
             Mock Remove-Item { throw 'Synthetic access denied' }
             $folder = [pscustomobject]@{ Name = 'Issue189[Probe]'; Path = $script:ProbeFolderPath }
 
-            $result = Remove-ResidualUserFolders -Folders @($folder)
+            $result = Remove-ResidualUserFolder -Folder $folder
 
             $result.Success | Should -BeFalse
             [System.IO.Directory]::Exists($script:ProbeFolderPath) | Should -BeTrue
@@ -563,6 +577,273 @@ $scriptBlock = {
             Assert-ProfileProbePowerShellDisposed -PowerShell $nextPowerShell
             Should -Invoke Write-Warning -Times 1 -Exactly -ParameterFilter {
                 $Message -like '*Synthetic dispose failure*' -and $WarningAction -eq 'Continue'
+            }
+        }
+    }
+
+    Context 'Divide-and-conquer residual scheduling with synthetic workers' {
+        BeforeAll {
+            $syntheticWorker = @'
+$scriptBlock = {
+    param($Folder)
+    Clear-ProgressLine
+    Write-ProgressUpdate -Activity 'Synthetic worker' -Percent 50
+    if ($Folder.Gate) {
+        [void]$Folder.Gate.Signal()
+        if (-not $Folder.Gate.Wait(5000)) { throw 'Synthetic workers did not run concurrently' }
+    }
+    Start-Sleep -Milliseconds $Folder.DelayMilliseconds
+    if ($Folder.Fail) { throw 'Synthetic residual-worker failure' }
+    [pscustomobject]@{
+        Type = 'ResidualFolder'
+        UserName = $Folder.Name
+        Path = $Folder.Path
+        Success = $true
+        Duration = [TimeSpan]::Zero
+    }
+}
+'@
+            $probeSource = $script:ResidualRemovalBatchDefinition.Remove(
+                $script:ResidualRemovalWorkerOffset, $script:ResidualRemovalWorkerLength
+            ).Insert($script:ResidualRemovalWorkerOffset, $syntheticWorker)
+            $probeSource = $probeSource.Replace('$ps = [PowerShell]::Create()', '$ps = New-TrackedResidualPowerShell')
+            $probeSource = $probeSource.Replace('$handle = $ps.BeginInvoke()', '$handle = Invoke-ResidualProbeBeginInvoke -PowerShell $ps')
+            if ($probeSource -match '\b(Remove-CimInstance|Remove-Item|Invoke-ExternalCommandWithLog|Remove-ResidualUserFolder)\b') {
+                throw 'A destructive command remained in the residual scheduling probe.'
+            }
+            . ([scriptblock]::Create($probeSource))
+
+            function New-TrackedResidualPowerShell {
+                $outstanding = $script:ResidualCreatedPowerShells.Count - $script:ResidualCollectedCount + 1
+                $script:ResidualPeakOutstanding = [Math]::Max($script:ResidualPeakOutstanding, $outstanding)
+                $powerShell = [PowerShell]::Create()
+                $script:ResidualCreatedPowerShells.Add($powerShell)
+                return $powerShell
+            }
+
+            function Invoke-ResidualProbeBeginInvoke {
+                param($PowerShell)
+                $PowerShell.BeginInvoke()
+            }
+
+            function Assert-ResidualProbePowerShellDisposed {
+                param($PowerShell)
+                $disposed = $false
+                try { [void]$PowerShell.AddScript('$null') }
+                catch { $disposed = $_.Exception.InnerException -is [System.ObjectDisposedException] }
+                $disposed | Should -BeTrue
+            }
+        }
+
+        BeforeEach {
+            $script:ResidualCreatedPowerShells = [System.Collections.Generic.List[object]]::new()
+            $script:ResidualCollectedCount = 0
+            $script:ResidualPeakOutstanding = 0
+            $script:ResidualReceivedNames = [System.Collections.Generic.List[string]]::new()
+            $script:ResidualProgress = [System.Collections.Generic.List[object]]::new()
+            Mock New-ProfileRemovalSessionState { & $script:ResidualSessionStateFactory }
+            Mock Write-ProgressUpdate {
+                $script:ResidualProgress.Add([pscustomobject]@{ Percent = $Percent; Completed = $script:ResidualCollectedCount })
+            }
+            Mock Clear-ProgressLine {}
+            Mock Receive-ProfileRemovalResult {
+                $script:ResidualReceivedNames.Add($Job.Folder.Name)
+                $result = & $script:ProfileBatchResultReceiver -Job $Job -ResultType $ResultType
+                $script:ResidualCollectedCount++
+                $result
+            }
+        }
+
+        AfterEach {
+            foreach ($powerShell in $script:ResidualCreatedPowerShells) { $powerShell.Dispose() }
+        }
+
+        It 'covers every leaf of <Count> folders with at most <Threads> live pipelines' -ForEach @(
+            @{ Count = 1; Threads = 1 },
+            @{ Count = 3; Threads = 2 },
+            @{ Count = 17; Threads = 4 },
+            @{ Count = 256; Threads = 4 }
+        ) {
+            $maxThreadsEffective = $Threads
+            $folders = @(for ($index = 0; $index -lt $Count; $index++) {
+                [pscustomobject]@{
+                    Name = "Residual[$index]"
+                    Path = "C:\Users\Residual[$index]"
+                    DelayMilliseconds = 1
+                    Fail = $false
+                    Gate = $null
+                }
+            })
+
+            $results = @(Remove-ResidualUserFolders -Folders $folders)
+
+            $script:ResidualPeakOutstanding | Should -BeLessOrEqual $Threads
+            $script:ResidualCreatedPowerShells.Count | Should -Be $Count
+            $script:ResidualCollectedCount | Should -Be $Count
+            $results.Count | Should -Be $Count
+            @($script:ResidualReceivedNames | Sort-Object -Unique).Count | Should -Be $Count
+            for ($index = 0; $index -lt $Count; $index++) {
+                $results[$index].Type | Should -Be 'ResidualFolder'
+                $results[$index].UserName | Should -Be $folders[$index].Name
+                $results[$index].Path | Should -Be $folders[$index].Path
+                $results[$index].Success | Should -BeTrue
+            }
+            $script:ResidualProgress[0].Percent | Should -Be 0
+            $script:ResidualProgress[-1].Percent | Should -Be 100
+            foreach ($progress in $script:ResidualProgress) {
+                $progress.Percent | Should -Be ([math]::Floor(($progress.Completed / $Count) * 100))
+            }
+            foreach ($powerShell in $script:ResidualCreatedPowerShells) {
+                Assert-ResidualProbePowerShellDisposed -PowerShell $powerShell
+            }
+        }
+
+        It 'completes an empty input without creating a pool or a worker' {
+            $maxThreadsEffective = 4
+
+            $results = @(Remove-ResidualUserFolders -Folders @())
+
+            $results.Count | Should -Be 0
+            $script:ResidualCreatedPowerShells.Count | Should -Be 0
+            $script:ResidualProgress[-1].Percent | Should -Be 100
+            Should -Invoke New-ProfileRemovalSessionState -Times 0 -Exactly
+            Should -Invoke Clear-ProgressLine -Times 1 -Exactly
+        }
+
+        It 'runs independent leaves concurrently in the same pool' {
+            $maxThreadsEffective = 2
+            $gate = [System.Threading.CountdownEvent]::new(2)
+            try {
+                $folders = @(for ($index = 0; $index -lt 2; $index++) {
+                    [pscustomobject]@{
+                        Name = "Concurrent$index"; Path = "C:\Users\Concurrent$index"
+                        DelayMilliseconds = 1; Fail = $false; Gate = $gate
+                    }
+                })
+
+                $results = @(Remove-ResidualUserFolders -Folders $folders)
+
+                $results.Count | Should -Be 2
+                @($results | Where-Object { -not $_.Success }).Count | Should -Be 0
+                $gate.CurrentCount | Should -Be 0
+            }
+            finally { $gate.Dispose() }
+        }
+
+        It 'passes the selected folder to the real worker script without running deletion commands' {
+            $maxThreadsEffective = 1
+            Mock New-ProfileRemovalSessionState {
+                $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+                $leafStub = @'
+param($Folder)
+[pscustomobject]@{
+    Type = 'ResidualFolder'
+    UserName = $Folder.Name
+    Path = $Folder.Path
+    Success = $true
+    Duration = [TimeSpan]::Zero
+}
+'@
+                $sessionState.Commands.Add(
+                    [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Remove-ResidualUserFolder', $leafStub)
+                )
+                return $sessionState
+            }
+            $folder = [pscustomobject]@{ Name = 'Bridge[Leaf]'; Path = 'C:\Users\Bridge[Leaf]' }
+
+            $results = @(& $script:ResidualRemovalBatchInvoker -Folders @($folder))
+
+            $results.Count | Should -Be 1
+            $results[0].Type | Should -Be 'ResidualFolder'
+            $results[0].UserName | Should -Be $folder.Name
+            $results[0].Path | Should -Be $folder.Path
+            $results[0].Success | Should -BeTrue
+        }
+
+        It 'starts another leaf before a slow leaf finishes and combines results in input order' {
+            $maxThreadsEffective = 2
+            $folders = @(
+                [pscustomobject]@{ Name = 'Slow'; Path = 'C:\Users\Slow'; DelayMilliseconds = 700; Fail = $false; Gate = $null },
+                [pscustomobject]@{ Name = 'Fast'; Path = 'C:\Users\Fast'; DelayMilliseconds = 1; Fail = $false; Gate = $null },
+                [pscustomobject]@{ Name = 'Next'; Path = 'C:\Users\Next'; DelayMilliseconds = 1; Fail = $false; Gate = $null }
+            )
+
+            $results = @(Remove-ResidualUserFolders -Folders $folders)
+
+            $script:ResidualReceivedNames[0] | Should -Be 'Fast'
+            $script:ResidualReceivedNames[1] | Should -Be 'Next'
+            $results[0].UserName | Should -Be 'Slow'
+            $results[1].UserName | Should -Be 'Fast'
+            $results[2].UserName | Should -Be 'Next'
+        }
+
+        It 'retains a failed residual leaf without losing its identity or the next leaf' {
+            $maxThreadsEffective = 1
+            $folders = @(
+                [pscustomobject]@{ Name = 'Failed[Leaf]'; Path = 'C:\Users\Failed[Leaf]'; DelayMilliseconds = 1; Fail = $true; Gate = $null },
+                [pscustomobject]@{ Name = 'Next'; Path = 'C:\Users\Next'; DelayMilliseconds = 1; Fail = $false; Gate = $null }
+            )
+
+            $results = @(Remove-ResidualUserFolders -Folders $folders)
+
+            $results.Count | Should -Be 2
+            $results[0].Type | Should -Be 'ResidualFolder'
+            $results[0].UserName | Should -Be $folders[0].Name
+            $results[0].Path | Should -Be $folders[0].Path
+            $results[0].Success | Should -BeFalse
+            $results[1].Success | Should -BeTrue
+            $script:ResidualCollectedCount | Should -Be 2
+            Get-Content -LiteralPath $Global:CurrentLogFile -Raw | Should -Match '\[ERROR\].*Synthetic residual-worker failure'
+        }
+
+        It 'disposes every residual instance when coordinator progress fails' {
+            $maxThreadsEffective = 2
+            $folders = @(for ($index = 0; $index -lt 2; $index++) {
+                [pscustomobject]@{
+                    Name = "Progress$index"; Path = "C:\Users\Progress$index"
+                    DelayMilliseconds = 1000; Fail = $false; Gate = $null
+                }
+            })
+            Mock Write-ProgressUpdate { throw 'Synthetic residual progress failure' }
+
+            { Remove-ResidualUserFolders -Folders $folders } | Should -Throw '*Synthetic residual progress failure*'
+
+            $script:ResidualCreatedPowerShells.Count | Should -Be 2
+            foreach ($powerShell in $script:ResidualCreatedPowerShells) {
+                Assert-ResidualProbePowerShellDisposed -PowerShell $powerShell
+            }
+        }
+
+        It 'disposes a residual instance when startup fails before registration' {
+            $maxThreadsEffective = 1
+            $folders = @([pscustomobject]@{
+                Name = 'Startup'; Path = 'C:\Users\Startup'; DelayMilliseconds = 1; Fail = $false; Gate = $null
+            })
+            Mock Invoke-ResidualProbeBeginInvoke { throw 'Synthetic residual startup failure' }
+
+            { Remove-ResidualUserFolders -Folders $folders } | Should -Throw '*Synthetic residual startup failure*'
+
+            $script:ResidualCreatedPowerShells.Count | Should -Be 1
+            Assert-ResidualProbePowerShellDisposed -PowerShell $script:ResidualCreatedPowerShells[0]
+        }
+
+        It 'cleans up remaining residual instances after collection throws' {
+            $maxThreadsEffective = 2
+            $folders = @(
+                [pscustomobject]@{ Name = 'Collected'; Path = 'C:\Users\Collected'; DelayMilliseconds = 1; Fail = $false; Gate = $null },
+                [pscustomobject]@{ Name = 'Remaining'; Path = 'C:\Users\Remaining'; DelayMilliseconds = 1000; Fail = $false; Gate = $null }
+            )
+            Mock Receive-ProfileRemovalResult {
+                & $script:ProfileBatchResultReceiver -Job $Job -ResultType $ResultType | Out-Null
+                $script:ResidualCollectedCount++
+                throw 'Synthetic residual collection failure'
+            }
+
+            { Remove-ResidualUserFolders -Folders $folders } | Should -Throw '*Synthetic residual collection failure*'
+
+            $script:ResidualCollectedCount | Should -Be 1
+            foreach ($powerShell in $script:ResidualCreatedPowerShells) {
+                Assert-ResidualProbePowerShellDisposed -PowerShell $powerShell
             }
         }
     }

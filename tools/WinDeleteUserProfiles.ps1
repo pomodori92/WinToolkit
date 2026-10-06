@@ -9,11 +9,12 @@ function WinDeleteUserProfiles {
         Excludes special and loaded profiles, system accounts, the current user profile, and protected names.
         After deleting registered profiles, checks the users folder and removes residual directories that are no
         longer associated with profiles in the registry or CIM, while preserving all protected exclusions.
+        Residual folders are divided into independent deletion tasks and processed with bounded parallelism.
 
         The script does not request interactive confirmation before deletion.
 
     .PARAMETER MaxThreads
-        Maximum number of parallel runspaces. Automatically limited to 4 for Win32_UserProfile.
+        Maximum number of parallel runspaces for each cleanup phase. Automatically limited to 4.
 
     .PARAMETER CountdownSeconds
         Number of seconds in the countdown before a recommended restart.
@@ -223,6 +224,7 @@ function WinDeleteUserProfiles {
                 'Invoke-ExternalCommandWithLog',
                 'Remove-ItemSafely',
                 'Remove-ProfileRegistryEntries',
+                'Remove-ResidualUserFolder',
                 'Get-SpinnerChar'
             )) {
             $command = Get-Command -Name $functionName -CommandType Function -ErrorAction Stop
@@ -259,11 +261,14 @@ function WinDeleteUserProfiles {
         return $sessionState
     }
 
-    # Collect a finished worker's result and release its pipeline before scheduling replacement work.
+    # Collect a finished deletion worker's result and release its pipeline before scheduling replacement work.
     function Receive-ProfileRemovalResult {
         param(
             [Parameter(Mandatory = $true)]
-            [object]$Job
+            [object]$Job,
+
+            [ValidateSet('Profile', 'ResidualFolder')]
+            [string]$ResultType = 'Profile'
         )
 
         try {
@@ -272,13 +277,24 @@ function WinDeleteUserProfiles {
         catch {
             Write-ToolkitLog -Level 'ERROR' -Message (Get-SourceTextLoc 'toolText.runspaceError0' -Args @($($_.Exception.Message)))
             # Preserve identity in a failed result so worker exceptions remain visible in summary counts.
-            [PSCustomObject]@{
-                Type     = 'Profile'
-                UserName = [System.IO.Path]::GetFileName($Job.Profile.LocalPath)
-                Path     = $Job.Profile.LocalPath
-                Sid      = $Job.Profile.SID
-                Success  = $false
-                Duration = [TimeSpan]::Zero
+            if ($ResultType -eq 'ResidualFolder') {
+                [PSCustomObject]@{
+                    Type     = 'ResidualFolder'
+                    UserName = $Job.Folder.Name
+                    Path     = $Job.Folder.Path
+                    Success  = $false
+                    Duration = [TimeSpan]::Zero
+                }
+            }
+            else {
+                [PSCustomObject]@{
+                    Type     = 'Profile'
+                    UserName = [System.IO.Path]::GetFileName($Job.Profile.LocalPath)
+                    Path     = $Job.Profile.LocalPath
+                    Sid      = $Job.Profile.SID
+                    Success  = $false
+                    Duration = [TimeSpan]::Zero
+                }
             }
         }
         finally {
@@ -554,75 +570,171 @@ function WinDeleteUserProfiles {
         }
     }
 
-    # Remove selected orphan folders separately, recording each outcome and retrying after ACL recovery if needed.
-    function Remove-ResidualUserFolders {
+    # Delete one residual folder as an independent leaf task, preserving literal paths and ACL recovery.
+    function Remove-ResidualUserFolder {
         param(
             [Parameter(Mandatory = $true)]
-            [array]$Folders
+            [object]$Folder
         )
 
-        $results = [System.Collections.Generic.List[object]]::new()
-        $total = $Folders.Count
-        $index = 0
+        $start = Get-Date
+        $success = $false
 
-        foreach ($folder in $Folders) {
-            $index++
-            $percent = if ($total -gt 0) { [math]::Floor(($index / $total) * 100) } else { 100 }
+        Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.startResidualFolder01' -Args @($($folder.Name), $($folder.Path)))
 
-            Write-ProgressUpdate -Activity (Get-SourceTextLoc 'toolText.extra.removingResidualFoldersInCUsers') -Status ("{0} / {1} - {2}" -f $index, $total, $folder.Name) -Percent $percent -Icon '🗑️'
+        $folderPath = $folder.Path
 
-            $start = Get-Date
-            $success = $false
+        try {
+            # Literal paths preserve folder names containing wildcard characters during deletion.
+            Remove-Item -LiteralPath $folderPath -Force -Recurse -ErrorAction Stop -Confirm:$false
+            # A completed command is insufficient; verify that the directory is actually gone.
+            $success = -not [System.IO.Directory]::Exists($folderPath)
+        }
+        catch {
+            Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.standardResidualFolderRemovalFailed01' -Args @($folderPath, $($_.Exception.Message)))
 
-            Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.startResidualFolder01' -Args @($($folder.Name), $($folder.Path)))
-
-            $folderPath = $folder.Path
-
+            # Retry with ownership and access repaired when normal filesystem deletion fails.
             try {
-                # Literal paths preserve folder names containing wildcard characters during deletion.
-                Remove-Item -LiteralPath $folderPath -Force -Recurse -ErrorAction Stop -Confirm:$false
-                # A completed command is insufficient; verify that the directory is actually gone.
+                Invoke-ExternalCommandWithLog -Command 'takeown.exe' -Arguments @('/F', "`"$folderPath`"", '/R', '/D', 'Y') -LogContextKey "ResidualTakeOwn-$($folder.Name)" | Out-Null
+                # S-1-5-32-544 - Fixed SID across Windows languages; avoids depending on localized group names.
+                Invoke-ExternalCommandWithLog -Command 'icacls.exe' -Arguments @("`"$folderPath`"", '/grant', '*S-1-5-32-544:F', '/T', '/C') -LogContextKey "ResidualIcacls-$($folder.Name)" | Out-Null
+                Remove-Item -LiteralPath $folderPath -Recurse -Force -ErrorAction Stop -Confirm:$false
                 $success = -not [System.IO.Directory]::Exists($folderPath)
             }
             catch {
-                Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.standardResidualFolderRemovalFailed01' -Args @($folderPath, $($_.Exception.Message)))
-
-                # Retry with ownership and access repaired when normal filesystem deletion fails.
-                try {
-                    Invoke-ExternalCommandWithLog -Command 'takeown.exe' -Arguments @('/F', "`"$folderPath`"", '/R', '/D', 'Y') -LogContextKey "ResidualTakeOwn-$($folder.Name)" | Out-Null
-                    # S-1-5-32-544 - Fixed SID across Windows languages; avoids depending on localized group names.
-                    Invoke-ExternalCommandWithLog -Command 'icacls.exe' -Arguments @("`"$folderPath`"", '/grant', '*S-1-5-32-544:F', '/T', '/C') -LogContextKey "ResidualIcacls-$($folder.Name)" | Out-Null
-                    Remove-Item -LiteralPath $folderPath -Recurse -Force -ErrorAction Stop -Confirm:$false
-                    $success = -not [System.IO.Directory]::Exists($folderPath)
-                }
-                catch {
-                    Write-ToolkitLog -Level 'ERROR' -Message (Get-SourceTextLoc 'toolText.remnantFolderRemovalFailed01' -Args @($folderPath, $($_.Exception.Message)))
-                    $success = $false
-                }
+                Write-ToolkitLog -Level 'ERROR' -Message (Get-SourceTextLoc 'toolText.remnantFolderRemovalFailed01' -Args @($folderPath, $($_.Exception.Message)))
+                $success = $false
             }
-
-            $duration = New-TimeSpan -Start $start -End (Get-Date)
-
-            if ($success) {
-                Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.completedResidualFolder01' -Args @($($folder.Name), $duration.ToString()))
-            }
-            else {
-                Write-ToolkitLog -Level 'ERROR' -Message (Get-SourceTextLoc 'toolText.failedResidualFolder0' -Args @($($folder.Name)))
-            }
-
-            $results.Add([PSCustomObject]@{
-                    Type     = 'ResidualFolder'
-                    UserName = $folder.Name
-                    Path     = $folder.Path
-                    Success  = $success
-                    Duration = $duration
-                }) | Out-Null
         }
 
-        Write-ProgressUpdate -Activity (Get-SourceTextLoc 'toolText.extra.removingResidualFoldersInCUsers') -Status (Get-SourceTextLoc 'uiText.completed') -Percent 100 -Icon '✅'
-        Clear-ProgressLine
+        $duration = New-TimeSpan -Start $start -End (Get-Date)
 
-        return $results
+        if ($success) {
+            Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.completedResidualFolder01' -Args @($($folder.Name), $duration.ToString()))
+        }
+        else {
+            Write-ToolkitLog -Level 'ERROR' -Message (Get-SourceTextLoc 'toolText.failedResidualFolder0' -Args @($($folder.Name)))
+        }
+
+        return [PSCustomObject]@{
+            Type     = 'ResidualFolder'
+            UserName = $folder.Name
+            Path     = $folder.Path
+            Success  = $success
+            Duration = $duration
+        }
+    }
+
+    # Divide the folder list into independent leaves, conquer them in one bounded pool, then combine ordered results.
+    function Remove-ResidualUserFolders {
+        param(
+            [Parameter(Mandatory = $true)]
+            [AllowEmptyCollection()]
+            [array]$Folders
+        )
+
+        $total = $Folders.Count
+        $results = [object[]]::new($total)
+        $jobs = [System.Collections.Generic.List[object]]::new()
+        $pendingPowerShell = $null
+        $pool = $null
+        $completed = 0
+        $lastPercent = -1
+
+        # Index ranges avoid copying folder arrays or creating a pipeline for every folder upfront.
+        # Depth-first bisection retains only a logarithmic number of pending ranges.
+        $ranges = [System.Collections.Generic.Stack[object]]::new()
+        if ($total -gt 0) {
+            $ranges.Push([PSCustomObject]@{ Start = 0; Count = $total })
+        }
+
+        $scriptBlock = {
+            param($Folder)
+            $ErrorActionPreference = 'Stop'
+            Remove-ResidualUserFolder -Folder $Folder
+        }
+
+        try {
+            if ($total -gt 0) {
+                $sessionState = New-ProfileRemovalSessionState
+                $pool = [RunspaceFactory]::CreateRunspacePool(1, $maxThreadsEffective, $sessionState, $Host)
+                $pool.Open()
+            }
+
+            while ($ranges.Count -gt 0 -or $jobs.Count -gt 0) {
+                # Reclaim completed pipelines before admitting another leaf task.
+                for ($jobIndex = $jobs.Count - 1; $jobIndex -ge 0; $jobIndex--) {
+                    $job = $jobs[$jobIndex]
+                    if (-not $job.Handle.IsCompleted) { continue }
+
+                    $results[$job.Index] = Receive-ProfileRemovalResult -Job $job -ResultType 'ResidualFolder'
+                    $jobs.RemoveAt($jobIndex)
+                    $completed++
+                }
+
+                while ($ranges.Count -gt 0 -and $jobs.Count -lt $maxThreadsEffective) {
+                    $range = $ranges.Pop()
+                    while ($range.Count -gt 1) {
+                        $leftCount = [int][math]::Floor($range.Count / 2)
+                        $ranges.Push([PSCustomObject]@{
+                                Start = $range.Start + $leftCount
+                                Count = $range.Count - $leftCount
+                            })
+                        $range = [PSCustomObject]@{ Start = $range.Start; Count = $leftCount }
+                    }
+
+                    # Each leaf owns one selected folder; completed leaves free slots immediately.
+                    $folder = $Folders[$range.Start]
+                    $ps = [PowerShell]::Create()
+                    $pendingPowerShell = $ps
+                    $ps.RunspacePool = $pool
+                    [void]$ps.AddScript($scriptBlock, $true).AddArgument($folder)
+                    $handle = $ps.BeginInvoke()
+                    $jobs.Add([PSCustomObject]@{
+                            PowerShell = $ps
+                            Handle     = $handle
+                            Folder     = $folder
+                            Index      = $range.Start
+                        })
+                    $pendingPowerShell = $null
+                }
+
+                # Only the coordinator renders progress, using completed work rather than scheduled work.
+                $percent = [math]::Floor(($completed / $total) * 100)
+                if ($percent -ne $lastPercent) {
+                    $lastPercent = $percent
+                    Write-ProgressUpdate -Activity (Get-SourceTextLoc 'toolText.extra.removingResidualFoldersInCUsers') -Status ("{0} / {1}" -f $completed, $total) -Percent $percent -Icon '🗑️'
+                }
+
+                if ($jobs.Count -gt 0) {
+                    $waitHandles = [System.Threading.WaitHandle[]]@($jobs | ForEach-Object { $_.Handle.AsyncWaitHandle })
+                    [void][System.Threading.WaitHandle]::WaitAny($waitHandles, 500)
+                }
+            }
+
+            Write-ProgressUpdate -Activity (Get-SourceTextLoc 'toolText.extra.removingResidualFoldersInCUsers') -Status (Get-SourceTextLoc 'uiText.completed') -Percent 100 -Icon '✅'
+            Clear-ProgressLine
+
+            # Original indices combine the independently completed leaves into a stable result sequence.
+            return $results
+        }
+        finally {
+            try {
+                if ($pendingPowerShell) {
+                    Close-ProfileRemovalPowerShell -PowerShell $pendingPowerShell
+                }
+                foreach ($job in $jobs) {
+                    Close-ProfileRemovalPowerShell -PowerShell $job.PowerShell
+                }
+                $jobs.Clear()
+            }
+            finally {
+                if ($pool) {
+                    try { $pool.Close() }
+                    finally { $pool.Dispose() }
+                }
+            }
+        }
     }
 
     # Both cleanup phases share the toolkit's progress, localization, and log context.
