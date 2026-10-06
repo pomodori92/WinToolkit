@@ -3917,6 +3917,7 @@ function DisableBitlocker {
     }
 }
 function WinDeleteUserProfiles {
+function WinDeleteUserProfiles {
     [CmdletBinding()]
     param(
         [ValidateRange(1, 4)]
@@ -4445,6 +4446,7 @@ function WinDeleteUserProfiles {
         Write-StyledMessage -Type 'Info' -Text ("♻️ " + (Get-SourceTextLoc 'toolText.winDeleteUserProfilesSessionEnded'))
         Write-ToolkitLog -Level INFO -Message (Get-SourceTextLoc 'toolText.winDeleteUserProfilesSessionEnded')
     }
+}
 }
 function Install-Office {
     [CmdletBinding()]
