@@ -1,3 +1,4 @@
+# Coordinate registered-profile and residual-folder cleanup with shared protections and result reporting.
 function WinDeleteUserProfiles {
     <#
     .SYNOPSIS
@@ -55,9 +56,11 @@ function WinDeleteUserProfiles {
     )
 
     $script:ToolName = 'WinDeleteUserProfiles'
+    # Keep a trailing separator so root checks cannot match sibling paths with the same prefix.
     $usersRoot = [System.IO.Path]::GetFullPath($UsersRoot.TrimEnd('\') + '\')
     $currentUser = $env:USERNAME
     $computerName = $env:COMPUTERNAME
+    # Resolve the current profile by SID because its folder name can differ from the account name.
     $currentUserSid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
     $currentUserProfilePath = (Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $_.SID -eq $currentUserSid } | Select-Object -First 1 -ExpandProperty LocalPath -ErrorAction SilentlyContinue)
     if ($currentUserProfilePath -and $currentUserProfilePath.StartsWith($usersRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -68,8 +71,10 @@ function WinDeleteUserProfiles {
     }
     $minimumLastUseDate = if ($MinimumProfileAgeDays -gt 0) { (Get-Date).AddDays(-$MinimumProfileAgeDays) } else { $null }
     $rebootRecommended = $false
+    # Cap simultaneous CIM operations and the resources held by the worker batch.
     $maxThreadsEffective = [Math]::Min($MaxThreads, 4)
 
+    # Preserve shared/system folders and both names that can identify the current user's profile.
     $protectedProfileNames = @(
         'Public',
         'Pubblica',
@@ -84,12 +89,15 @@ function WinDeleteUserProfiles {
         $currentUserFolder
     ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
 
+    # Apply the same case-insensitive name exclusions to registered profiles and residual folders.
     function New-ProtectedNameSet {
         $excluded = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         $protectedProfileNames | ForEach-Object { [void]$excluded.Add($_) }
+        # The unary comma returns the set itself instead of enumerating its entries into the pipeline.
         return , $excluded
     }
 
+    # Remove leftover ProfileList state after the profile directory is gone, reporting registry failure separately.
     function Remove-ProfileRegistryEntries {
         param(
             [Parameter(Mandatory = $true)]
@@ -99,12 +107,14 @@ function WinDeleteUserProfiles {
             [string]$UserName
         )
 
+        # Never construct a destructive registry path from a missing or placeholder SID.
         if ([string]::IsNullOrWhiteSpace($Sid) -or $Sid -eq 'NULL') { 
             return $false
         }
 
         $profileRegKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\' + $Sid
 
+        # CIM removal can already delete this key; an absent entry counts as successful cleanup.
         if (-not (Test-Path -LiteralPath $profileRegKey)) {
             return $true
         }
@@ -122,6 +132,7 @@ function WinDeleteUserProfiles {
         }
     }
 
+    # Collect normalized registered paths so the residual scan preserves folders still associated with CIM profiles.
     function Get-RegisteredProfilePathSet {
         $pathSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
@@ -151,6 +162,7 @@ function WinDeleteUserProfiles {
         return , $pathSet
     }
 
+    # Select unloaded, non-special profiles under the configured root before scheduling destructive work.
     function Get-RemovableUserProfiles {
         $excluded = New-ProtectedNameSet
 
@@ -166,6 +178,7 @@ function WinDeleteUserProfiles {
             return
         }
 
+        # Active sessions and Windows-managed special profiles must keep their profile data.
         $profiles = $profiles | Where-Object {
             -not $_.Special -and
             -not $_.Loaded -and
@@ -181,11 +194,13 @@ function WinDeleteUserProfiles {
                 continue
             }
 
+            # Protect the current account independently of folder-name exclusions.
             if ($profileItem.SID -eq $currentUserSid) {
                 Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.excludedProfileBecauseSidMatchesCurrentUser0' -Args @($profileName, $profileItem.SID))
                 continue
             }
 
+            # Apply the optional age cutoff only when Windows provides a last-use timestamp.
             if ($minimumLastUseDate -and $profileItem.LastUseTime) {
                 $lastUse = $profileItem.LastUseTime
                 if ($lastUse -gt $minimumLastUseDate) {
@@ -198,8 +213,8 @@ function WinDeleteUserProfiles {
         }
     }
 
+    # Supply worker dependencies explicitly: runspaces do not inherit toolkit functions or language/log context.
     function New-ProfileRemovalSessionState {
-        # Runspaces do not inherit the toolkit functions or the active language/log context.
         $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
 
         foreach ($functionName in @(
@@ -236,6 +251,7 @@ function WinDeleteUserProfiles {
                 [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new($variableName, $value, '')
             )
         }
+        # Shared helpers must leave console rendering to the parent even inside worker sessions.
         $sessionState.Variables.Add(
             [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('GuiSessionActive', $true, '')
         )
@@ -243,6 +259,7 @@ function WinDeleteUserProfiles {
         return $sessionState
     }
 
+    # Collect a finished worker's result and release its pipeline before scheduling replacement work.
     function Receive-ProfileRemovalResult {
         param(
             [Parameter(Mandatory = $true)]
@@ -254,6 +271,7 @@ function WinDeleteUserProfiles {
         }
         catch {
             Write-ToolkitLog -Level 'ERROR' -Message (Get-SourceTextLoc 'toolText.runspaceError0' -Args @($($_.Exception.Message)))
+            # Preserve identity in a failed result so worker exceptions remain visible in summary counts.
             [PSCustomObject]@{
                 Type     = 'Profile'
                 UserName = [System.IO.Path]::GetFileName($Job.Profile.LocalPath)
@@ -264,11 +282,13 @@ function WinDeleteUserProfiles {
             }
         }
         finally {
+            # Release command references and pipeline resources as soon as collection finishes.
             $Job.PowerShell.Commands.Clear()
             $Job.PowerShell.Dispose()
         }
     }
 
+    # Clean up workers abandoned by a batch failure while keeping individual cleanup errors non-terminating.
     function Close-ProfileRemovalPowerShell {
         param(
             [Parameter(Mandatory = $true)]
@@ -278,11 +298,14 @@ function WinDeleteUserProfiles {
         try {
             $PowerShell.Stop()
         }
+        # Collection may have disposed the instance before a later batch operation failed.
         catch [System.ObjectDisposedException] {}
         catch {
+            # Explicit Continue prevents the caller's warning preference from interrupting cleanup.
             Write-Warning -Message $_.Exception.Message -WarningAction Continue
         }
         finally {
+            # Dispose must still run when Stop fails.
             try {
                 $PowerShell.Dispose()
             }
@@ -292,6 +315,7 @@ function WinDeleteUserProfiles {
         }
     }
 
+    # Bound the number of live pipelines while returning one result per profile in the original input order.
     function Invoke-ProfileRemovalBatch {
         param(
             [Parameter(Mandatory = $true)]
@@ -301,12 +325,15 @@ function WinDeleteUserProfiles {
         $sessionState = New-ProfileRemovalSessionState
         $pool = [RunspaceFactory]::CreateRunspacePool(1, $maxThreadsEffective, $sessionState, $Host)
 
+        # Retain only outstanding jobs so pipeline memory stays bounded by the concurrency limit.
         $jobs = [System.Collections.Generic.List[object]]::new()
+        # Keep ownership of a new instance until startup succeeds and it joins the tracked job list.
         $pendingPowerShell = $null
 
         $scriptBlock = {
             param($ProfileItem)
 
+            # Terminating errors route failed deletion steps through their fallback cleanup paths.
             $ErrorActionPreference = 'Stop'
 
             $userPath = $ProfileItem.LocalPath
@@ -316,6 +343,7 @@ function WinDeleteUserProfiles {
 
             Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.startResidualFolder01' -Args @($userName, $userPath))
 
+            # Let Windows remove the registered profile first; filesystem cleanup handles any leftovers.
             try {
                 Remove-CimInstance -InputObject $ProfileItem -ErrorAction Stop -Confirm:$false
                 Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.cimProfileRemoved0' -Args @($userName))
@@ -326,6 +354,7 @@ function WinDeleteUserProfiles {
 
             if ([System.IO.Directory]::Exists($userPath)) {
                 try {
+                    # An empty source lets /MIR remove leftover contents; /XJ excludes junctions.
                     $tempEmpty = Join-Path $env:TEMP "EmptyFolder"
 
                     if (-not (Test-Path $tempEmpty)) {
@@ -343,6 +372,7 @@ function WinDeleteUserProfiles {
                 catch {
                     Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.standardFolderCleanupFailed01' -Args @($userName, $($_.Exception.Message)))
 
+                    # Repair ownership and access if permissions prevented standard folder removal.
                     try {
                         Invoke-ExternalCommandWithLog -Command 'takeown.exe' -Arguments @('/F', "`"$userPath`"", '/R', '/D', 'Y') -LogContextKey "ProfileCleanup-TakeOwn-$userName" | Out-Null
                         # S-1-5-32-544 - Fixed SID across Windows languages; avoids depending on localized group names.
@@ -356,6 +386,7 @@ function WinDeleteUserProfiles {
                 }
             }
 
+            # Remove any remaining registry entry only after the directory is gone; require both outcomes for success.
             $folderGone = -not [System.IO.Directory]::Exists($userPath)
             $registrySuccess = $false
             if ($folderGone -and $userSid) {
@@ -385,12 +416,14 @@ function WinDeleteUserProfiles {
         try {
             $pool.Open()
             $total = $Profiles.Count
+            # Workers finish out of order, so store each result at its original profile index.
             $results = [object[]]::new($total)
             $nextProfileIndex = 0
             $completed = 0
             $lastPercent = -1
 
             do {
+                # Walk backwards so removing completed jobs cannot shift an unvisited entry.
                 for ($jobIndex = $jobs.Count - 1; $jobIndex -ge 0; $jobIndex--) {
                     $job = $jobs[$jobIndex]
                     if (-not $job.Handle.IsCompleted) { continue }
@@ -400,6 +433,7 @@ function WinDeleteUserProfiles {
                     $completed++
                 }
 
+                # Create replacements only after collection frees a slot, bounding queued and running instances.
                 while ($nextProfileIndex -lt $total -and $jobs.Count -lt $maxThreadsEffective) {
                     $profileItem = $Profiles[$nextProfileIndex]
                     $ps = [PowerShell]::Create()
@@ -417,18 +451,21 @@ function WinDeleteUserProfiles {
                             Profile    = $profileItem
                             Index      = $nextProfileIndex
                         })
+                    # Transfer cleanup ownership only after the new job has been registered successfully.
                     $pendingPowerShell = $null
                     $nextProfileIndex++
                 }
 
                 $percent = if ($total -gt 0) { [math]::Floor(($completed / $total) * 100) } else { 100 }
 
+                # Update the console only when the whole-number percentage changes.
                 if ($percent -ne $lastPercent) {
                     $lastPercent = $percent
                     Write-ProgressUpdate -Activity (Get-SourceTextLoc 'toolText.extra.removingRegisteredProfiles') -Status (Get-SourceTextLoc 'toolText.extra.01Completed' -Args @($completed, $total)) -Percent $percent -Icon '🗑️'
                 }
 
                 if ($jobs.Count -gt 0) {
+                    # Wait for any worker or a short timeout instead of continuously polling completion.
                     $waitHandles = [System.Threading.WaitHandle[]]@($jobs | ForEach-Object { $_.Handle.AsyncWaitHandle })
                     [void][System.Threading.WaitHandle]::WaitAny($waitHandles, 500)
                 }
@@ -440,6 +477,7 @@ function WinDeleteUserProfiles {
             return $results
         }
         finally {
+            # Failure paths can bypass collection, leaving pending or tracked instances for this cleanup.
             try {
                 if ($pendingPowerShell) {
                     Close-ProfileRemovalPowerShell -PowerShell $pendingPowerShell
@@ -450,6 +488,7 @@ function WinDeleteUserProfiles {
                 $jobs.Clear()
             }
             finally {
+                # Release the pool even after instance cleanup fails, and dispose it even if Close fails.
                 if ($pool) {
                     try { $pool.Close() }
                     finally { $pool.Dispose() }
@@ -458,18 +497,22 @@ function WinDeleteUserProfiles {
         }
     }
 
+    # Select leftover directories only after protected-name, CIM-path, registered-SID, and link exclusions.
     function Get-ResidualUserFolders {
         $excluded = New-ProtectedNameSet
+        # Refresh registration after profile removal so this scan reflects the state Windows now reports.
         $registeredProfilePaths = Get-RegisteredProfilePathSet
 
         Write-StyledMessage -Type 'Info' -Text ("🔎 " + (Get-SourceTextLoc 'toolText.checkResidualFoldersInTheUsersDirectory'))
         Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.checkResidualFoldersInTheUsersDirectory')
 
+        # Exclude reparse points so residual cleanup does not select links into other locations.
         $folders = Get-ChildItem -Path $usersRoot -Directory -Force |
         Where-Object {
             -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)
         }
 
+        # SID-named folders need a registry exclusion in addition to the CIM path exclusion.
         $profileListKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
         $registeredSids = @()
         try {
@@ -498,6 +541,7 @@ function WinDeleteUserProfiles {
                 continue
             }
 
+            # Keep the link exclusion at candidate selection as well as during initial enumeration.
             if ($folder.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
                 Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.residualFolderExcludedBecauseReparsePointSymlink01' -Args @($folderName, $folderPath))
                 continue
@@ -510,6 +554,7 @@ function WinDeleteUserProfiles {
         }
     }
 
+    # Remove selected orphan folders separately, recording each outcome and retrying after ACL recovery if needed.
     function Remove-ResidualUserFolders {
         param(
             [Parameter(Mandatory = $true)]
@@ -534,12 +579,15 @@ function WinDeleteUserProfiles {
             $folderPath = $folder.Path
 
             try {
+                # Literal paths preserve folder names containing wildcard characters during deletion.
                 Remove-Item -LiteralPath $folderPath -Force -Recurse -ErrorAction Stop -Confirm:$false
+                # A completed command is insufficient; verify that the directory is actually gone.
                 $success = -not [System.IO.Directory]::Exists($folderPath)
             }
             catch {
                 Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.standardResidualFolderRemovalFailed01' -Args @($folderPath, $($_.Exception.Message)))
 
+                # Retry with ownership and access repaired when normal filesystem deletion fails.
                 try {
                     Invoke-ExternalCommandWithLog -Command 'takeown.exe' -Arguments @('/F', "`"$folderPath`"", '/R', '/D', 'Y') -LogContextKey "ResidualTakeOwn-$($folder.Name)" | Out-Null
                     # S-1-5-32-544 - Fixed SID across Windows languages; avoids depending on localized group names.
@@ -577,9 +625,11 @@ function WinDeleteUserProfiles {
         return $results
     }
 
+    # Both cleanup phases share the toolkit's progress, localization, and log context.
     Start-ToolkitSession -ToolName $script:ToolName -SubTitle (Get-SourceTextLoc 'script.WinDeleteUserProfiles')
 
     try {
+        # Validate the configured directory before either cleanup phase can delete anything.
         if (-not (Test-Path -LiteralPath $usersRoot -PathType Container)) {
             throw (Get-SourceTextLoc 'toolText.extra.profilePathDoesNotExist0' -Args @($usersRoot))
         }
@@ -629,6 +679,7 @@ function WinDeleteUserProfiles {
             Write-StyledMessage -Type 'Success' -Text ((Get-SourceTextLoc 'toolText.noRemovableRegisteredProfilesFound'))
         }
 
+        # Scan leftovers after registered-profile removal using the updated registration state.
         if (-not $SkipResidualFolderCleanup) {
             $residualFolders = @(Get-ResidualUserFolders)
 
@@ -651,11 +702,13 @@ function WinDeleteUserProfiles {
             Write-StyledMessage -Type 'Warning' -Text (Get-SourceTextLoc 'toolText.residualFolderCleanupSkippedForSkipresidualfoldercleanupParameter')
         }
 
+        # Report successes separately for each phase, but base restart advice on failures from either phase.
         $allResults = @($profileResults) + @($residualResults)
         $failedCount = @($allResults | Where-Object { -not $_.Success }).Count
         $profileSuccessCount = @($profileResults | Where-Object { $_.Success }).Count
         $residualSuccessCount = @($residualResults | Where-Object { $_.Success }).Count
 
+        # Open sessions or handles may prevent cleanup; recommend a restart only when items failed.
         if ($failedCount -gt 0) {
             $rebootRecommended = $true
             Write-StyledMessage -Type 'Warning' -Text ((Get-SourceTextLoc 'toolText.extra.restartRecommendedAfterProfileCleanup'))
@@ -669,14 +722,17 @@ function WinDeleteUserProfiles {
         }
 
         if ($rebootRecommended) {
+            # Forward suppression so a toolkit batch can manage its final restart centrally.
             Invoke-ToolkitReboot -Message (Get-SourceTextLoc 'toolText.extra.restartRecommendedAfterProfileCleanup') -Seconds $CountdownSeconds -SuppressIndividualReboot:$SuppressIndividualReboot
         }
     }
     catch {
         Write-ToolkitError -Record $_ -ToolName $script:ToolName
+        # Preserve the original exception so the caller can detect an unsuccessful run.
         throw
     }
     finally {
+        # Report that the session ended even when a cleanup phase throws.
         Write-StyledMessage -Type 'Info' -Text ("♻️ " + (Get-SourceTextLoc 'toolText.winDeleteUserProfilesSessionEnded'))
         Write-ToolkitLog -Level INFO -Message (Get-SourceTextLoc 'toolText.winDeleteUserProfilesSessionEnded')
     }
