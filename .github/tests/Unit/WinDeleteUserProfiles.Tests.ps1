@@ -19,6 +19,7 @@ Describe 'Issue #189 safe regressions' {
         $definitions = @(
             @{ Path = $toolPath; Name = 'New-ProfileRemovalSessionState' },
             @{ Path = $toolPath; Name = 'Receive-ProfileRemovalResult' },
+            @{ Path = $toolPath; Name = 'Close-ProfileRemovalPowerShell' },
             @{ Path = $toolPath; Name = 'Remove-ProfileRegistryEntries' },
             @{ Path = $toolPath; Name = 'Remove-ResidualUserFolders' },
             @{ Path = $localizationPath; Name = 'Get-SourceTextLoc' },
@@ -369,6 +370,7 @@ $scriptBlock = {
                 $script:ProfileRemovalWorkerOffset, $script:ProfileRemovalWorkerLength
             ).Insert($script:ProfileRemovalWorkerOffset, $syntheticWorker)
             $probeSource = $probeSource.Replace('$ps = [PowerShell]::Create()', '$ps = New-TrackedProfilePowerShell')
+            $probeSource = $probeSource.Replace('$handle = $ps.BeginInvoke()', '$handle = Invoke-ProfileProbeBeginInvoke -PowerShell $ps')
             if ($probeSource -match '\b(Remove-CimInstance|Remove-Item|Invoke-ExternalCommandWithLog)\b') {
                 throw 'A destructive command remained in the scheduling probe.'
             }
@@ -380,6 +382,19 @@ $scriptBlock = {
                 $powerShell = [PowerShell]::Create()
                 $script:BatchCreatedPowerShells.Add($powerShell)
                 return $powerShell
+            }
+
+            function Invoke-ProfileProbeBeginInvoke {
+                param($PowerShell)
+                $PowerShell.BeginInvoke()
+            }
+
+            function Assert-ProfileProbePowerShellDisposed {
+                param($PowerShell)
+                $disposed = $false
+                try { [void]$PowerShell.AddScript('$null') }
+                catch { $disposed = $_.Exception.InnerException -is [System.ObjectDisposedException] }
+                $disposed | Should -BeTrue
             }
         }
 
@@ -431,6 +446,9 @@ $scriptBlock = {
                 $results[$index].UserName | Should -Be $profiles[$index].Name
             }
             $script:BatchProgress[-1] | Should -Be 100
+            foreach ($powerShell in $script:BatchCreatedPowerShells) {
+                Assert-ProfileProbePowerShellDisposed -PowerShell $powerShell
+            }
         }
 
         It 'returns input order when a later worker finishes first' {
@@ -463,6 +481,89 @@ $scriptBlock = {
             $results[1].UserName | Should -Be 'Next'
             $results[1].Success | Should -BeTrue
             $script:BatchCollectedCount | Should -Be 2
+        }
+
+        It 'disposes every outstanding instance when progress reporting fails' {
+            $maxThreadsEffective = 2
+            $profiles = @(
+                [pscustomobject]@{ Name = 'First'; LocalPath = 'C:\Users\First'; SID = 'first'; DelayMilliseconds = 1000; Fail = $false },
+                [pscustomobject]@{ Name = 'Second'; LocalPath = 'C:\Users\Second'; SID = 'second'; DelayMilliseconds = 1000; Fail = $false }
+            )
+            Mock Write-ProgressUpdate { throw 'Synthetic progress failure' }
+
+            { Invoke-ProfileRemovalBatch -Profiles $profiles } | Should -Throw '*Synthetic progress failure*'
+
+            $script:BatchCreatedPowerShells.Count | Should -Be 2
+            foreach ($powerShell in $script:BatchCreatedPowerShells) {
+                Assert-ProfileProbePowerShellDisposed -PowerShell $powerShell
+            }
+        }
+
+        It 'disposes an instance when startup fails before job registration' {
+            $maxThreadsEffective = 1
+            $profiles = @([pscustomobject]@{
+                Name = 'Startup'; LocalPath = 'C:\Users\Startup'; SID = 'startup'; DelayMilliseconds = 1; Fail = $false
+            })
+            Mock Invoke-ProfileProbeBeginInvoke { throw 'Synthetic startup failure' }
+
+            { Invoke-ProfileRemovalBatch -Profiles $profiles } | Should -Throw '*Synthetic startup failure*'
+
+            $script:BatchCreatedPowerShells.Count | Should -Be 1
+            Assert-ProfileProbePowerShellDisposed -PowerShell $script:BatchCreatedPowerShells[0]
+        }
+
+        It 'disposes remaining instances when collection fails after one instance was disposed' {
+            $maxThreadsEffective = 2
+            $profiles = @(
+                [pscustomobject]@{ Name = 'Collected'; LocalPath = 'C:\Users\Collected'; SID = 'collected'; DelayMilliseconds = 1; Fail = $false },
+                [pscustomobject]@{ Name = 'Remaining'; LocalPath = 'C:\Users\Remaining'; SID = 'remaining'; DelayMilliseconds = 1000; Fail = $false }
+            )
+            Mock Receive-ProfileRemovalResult {
+                & $script:ProfileBatchResultReceiver -Job $Job | Out-Null
+                $script:BatchCollectedCount++
+                throw 'Synthetic collection failure'
+            }
+
+            { Invoke-ProfileRemovalBatch -Profiles $profiles } | Should -Throw '*Synthetic collection failure*'
+
+            $script:BatchCollectedCount | Should -Be 1
+            foreach ($powerShell in $script:BatchCreatedPowerShells) {
+                Assert-ProfileProbePowerShellDisposed -PowerShell $powerShell
+            }
+        }
+
+        It 'still disposes an instance when stopping it fails' {
+            $powerShell = [pscustomobject]@{ Disposed = $false }
+            $powerShell | Add-Member -MemberType ScriptMethod -Name Stop -Value { throw 'Synthetic stop failure' }
+            $powerShell | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.Disposed = $true }
+            Mock Write-Warning {}
+
+            { Close-ProfileRemovalPowerShell -PowerShell $powerShell } | Should -Not -Throw
+
+            $powerShell.Disposed | Should -BeTrue
+            Should -Invoke Write-Warning -Times 1 -Exactly -ParameterFilter {
+                $Message -like '*Synthetic stop failure*' -and $WarningAction -eq 'Continue'
+            }
+        }
+
+        It 'continues cleanup after a disposal failure and reports the failure' {
+            $failedPowerShell = [pscustomobject]@{}
+            $failedPowerShell | Add-Member -MemberType ScriptMethod -Name Stop -Value {}
+            $failedPowerShell | Add-Member -MemberType ScriptMethod -Name Dispose -Value { throw 'Synthetic dispose failure' }
+            $nextPowerShell = [PowerShell]::Create()
+            $script:BatchCreatedPowerShells.Add($nextPowerShell)
+            Mock Write-Warning {}
+
+            {
+                foreach ($powerShell in @($failedPowerShell, $nextPowerShell)) {
+                    Close-ProfileRemovalPowerShell -PowerShell $powerShell
+                }
+            } | Should -Not -Throw
+
+            Assert-ProfileProbePowerShellDisposed -PowerShell $nextPowerShell
+            Should -Invoke Write-Warning -Times 1 -Exactly -ParameterFilter {
+                $Message -like '*Synthetic dispose failure*' -and $WarningAction -eq 'Continue'
+            }
         }
     }
 }
