@@ -331,23 +331,77 @@ function WinDeleteUserProfiles {
         }
     }
 
-    # Bound the number of live pipelines while returning one result per profile in the original input order.
+    # Partition leftovers into disjoint directory subtrees without enumerating every file in a large profile.
+    function Get-ProfileCleanupSubtrees {
+        param(
+            [Parameter(Mandatory = $true)]
+            [string]$Path
+        )
+
+        try {
+            $root = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+            if ($root.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return }
+            $directories = @(Get-ChildItem -LiteralPath $Path -Directory -Force -ErrorAction Stop)
+        }
+        catch {
+            # Enumeration failure leaves the original whole-profile cleanup responsible for recovery.
+            Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.standardFolderCleanupFailed01' -Args @($Path, $($_.Exception.Message)))
+            return
+        }
+
+        foreach ($directory in $directories) {
+            if ($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+            try {
+                # A second level separates common AppData branches; parent files stay for finalization.
+                $children = @(Get-ChildItem -LiteralPath $directory.FullName -Directory -Force -ErrorAction Stop |
+                    Where-Object { -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) })
+            }
+            catch {
+                Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.standardFolderCleanupFailed01' -Args @($directory.FullName, $($_.Exception.Message)))
+                $children = @()
+            }
+
+            # Emit either the parent or its children, never both, so workers cannot delete overlapping paths.
+            if ($children.Count -gt 0) {
+                foreach ($child in $children) { $child.FullName }
+            }
+            else {
+                $directory.FullName
+            }
+        }
+    }
+
+    # Divide leftover subtrees in one shared pool, then combine them into one result per original profile.
     function Invoke-ProfileRemovalBatch {
         param(
             [Parameter(Mandatory = $true)]
+            [AllowEmptyCollection()]
             [array]$Profiles
         )
-
-        $sessionState = New-ProfileRemovalSessionState
-        $pool = [RunspaceFactory]::CreateRunspacePool(1, $maxThreadsEffective, $sessionState, $Host)
 
         # Retain only outstanding jobs so pipeline memory stays bounded by the concurrency limit.
         $jobs = [System.Collections.Generic.List[object]]::new()
         # Keep ownership of a new instance until startup succeeds and it joins the tracked job list.
         $pendingPowerShell = $null
+        $pool = $null
+        $total = $Profiles.Count
+        $results = [object[]]::new($total)
+        $completed = 0
+        $lastPercent = -1
+
+        # Store index ranges, splitting lazily until a free worker can take one leaf.
+        $ranges = [System.Collections.Generic.Stack[object]]::new()
+        if ($total -gt 0) {
+            $ranges.Push([PSCustomObject]@{ Phase = 'Prepare'; Start = 0; Count = $total; Context = $null })
+        }
 
         $scriptBlock = {
-            param($ProfileItem)
+            param(
+                $ProfileItem,
+                [ValidateSet('Complete', 'Prepare', 'Folder', 'Finalize')]
+                [string]$Phase = 'Complete',
+                [datetime]$StartTime = [datetime]::MinValue
+            )
 
             # Terminating errors route failed deletion steps through their fallback cleanup paths.
             $ErrorActionPreference = 'Stop'
@@ -355,17 +409,35 @@ function WinDeleteUserProfiles {
             $userPath = $ProfileItem.LocalPath
             $userName = [System.IO.Path]::GetFileName($userPath)
             $userSid = $ProfileItem.SID
-            $start = Get-Date
+            $start = if ($StartTime -eq [datetime]::MinValue) { Get-Date } else { $StartTime }
 
-            Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.startResidualFolder01' -Args @($userName, $userPath))
+            if ($Phase -ne 'Finalize') {
+                Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.startResidualFolder01' -Args @($userName, $userPath))
+            }
 
             # Let Windows remove the registered profile first; filesystem cleanup handles any leftovers.
-            try {
-                Remove-CimInstance -InputObject $ProfileItem -ErrorAction Stop -Confirm:$false
-                Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.cimProfileRemoved0' -Args @($userName))
+            if ($Phase -in @('Complete', 'Prepare')) {
+                try {
+                    Remove-CimInstance -InputObject $ProfileItem -ErrorAction Stop -Confirm:$false
+                    Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.cimProfileRemoved0' -Args @($userName))
+                }
+                catch {
+                    Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.cimRemoveFailed01' -Args @($userName, $($_.Exception.Message)))
+                }
             }
-            catch {
-                Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.cimRemoveFailed01' -Args @($userName, $($_.Exception.Message)))
+
+            if ($Phase -eq 'Prepare' -and [System.IO.Directory]::Exists($userPath)) {
+                # Return control to the coordinator before any child or parent filesystem deletion starts.
+                return [PSCustomObject]@{ Type = 'ProfilePreparation'; Start = $start }
+            }
+
+            if ($Phase -eq 'Folder' -and [System.IO.Directory]::Exists($userPath) -and
+                ((Get-Item -LiteralPath $userPath -Force -ErrorAction Stop).Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                # A link created after partitioning must not become a subtree deletion target.
+                return [PSCustomObject]@{
+                    Type = 'ResidualFolder'; UserName = $userName; Path = $userPath
+                    Success = $false; Duration = [TimeSpan]::Zero
+                }
             }
 
             if ([System.IO.Directory]::Exists($userPath)) {
@@ -374,7 +446,8 @@ function WinDeleteUserProfiles {
                     $tempEmpty = Join-Path $env:TEMP "EmptyFolder"
 
                     if (-not (Test-Path $tempEmpty)) {
-                        New-Item -ItemType Directory -Path $tempEmpty | Out-Null
+                        # Concurrent subtree workers can create the shared empty directory safely.
+                        [void][System.IO.Directory]::CreateDirectory($tempEmpty)
                     }
 
                     Invoke-ExternalCommandWithLog -Command 'robocopy.exe' `
@@ -402,8 +475,16 @@ function WinDeleteUserProfiles {
                 }
             }
 
-            # Remove any remaining registry entry only after the directory is gone; require both outcomes for success.
             $folderGone = -not [System.IO.Directory]::Exists($userPath)
+            if ($Phase -eq 'Folder') {
+                # Child results never touch profile registration or count as completed profiles.
+                return [PSCustomObject]@{
+                    Type = 'ResidualFolder'; UserName = $userName; Path = $userPath
+                    Success = $folderGone; Duration = (New-TimeSpan -Start $start -End (Get-Date))
+                }
+            }
+
+            # Remove any remaining registry entry only after the directory is gone; require both outcomes for success.
             $registrySuccess = $false
             if ($folderGone -and $userSid) {
                 $registrySuccess = Remove-ProfileRegistryEntries -Sid $userSid -UserName $userName
@@ -430,34 +511,91 @@ function WinDeleteUserProfiles {
         }
 
         try {
-            $pool.Open()
-            $total = $Profiles.Count
-            # Workers finish out of order, so store each result at its original profile index.
-            $results = [object[]]::new($total)
-            $nextProfileIndex = 0
-            $completed = 0
-            $lastPercent = -1
+            if ($total -gt 0) {
+                $sessionState = New-ProfileRemovalSessionState
+                $pool = [RunspaceFactory]::CreateRunspacePool(1, $maxThreadsEffective, $sessionState, $Host)
+                $pool.Open()
+            }
 
-            do {
+            while ($ranges.Count -gt 0 -or $jobs.Count -gt 0) {
                 # Walk backwards so removing completed jobs cannot shift an unvisited entry.
                 for ($jobIndex = $jobs.Count - 1; $jobIndex -ge 0; $jobIndex--) {
                     $job = $jobs[$jobIndex]
                     if (-not $job.Handle.IsCompleted) { continue }
 
-                    $results[$job.Index] = Receive-ProfileRemovalResult -Job $job
+                    $resultType = if ($job.Phase -eq 'Folder') { 'ResidualFolder' } else { 'Profile' }
+                    $result = Receive-ProfileRemovalResult -Job $job -ResultType $resultType
                     $jobs.RemoveAt($jobIndex)
-                    $completed++
+
+                    if ($job.Phase -eq 'Folder') {
+                        $job.Context.Remaining--
+                        if ($job.Context.Remaining -eq 0) {
+                            # Finalize this parent only after every child has been collected, including failures.
+                            $ranges.Push([PSCustomObject]@{ Phase = 'Finalize'; Start = 0; Count = 1; Context = $job.Context })
+                        }
+                    }
+                    elseif ($result.Type -eq 'ProfilePreparation') {
+                        $paths = @(Get-ProfileCleanupSubtrees -Path $job.Profile.LocalPath)
+                        $context = [PSCustomObject]@{
+                            Profile = $job.Profile; Index = $job.Index; Start = $result.Start
+                            Paths = $paths; Remaining = $paths.Count
+                        }
+                        if ($paths.Count -gt 1) {
+                            $ranges.Push([PSCustomObject]@{ Phase = 'Folder'; Start = 0; Count = $paths.Count; Context = $context })
+                        }
+                        else {
+                            # Small or inaccessible trees use the original cleanup without extra child pipelines.
+                            $ranges.Push([PSCustomObject]@{ Phase = 'Finalize'; Start = 0; Count = 1; Context = $context })
+                        }
+                    }
+                    else {
+                        # Workers finish out of order; only final profile results occupy the original index.
+                        $results[$job.Index] = $result
+                        $completed++
+                    }
                 }
 
                 # Create replacements only after collection frees a slot, bounding queued and running instances.
-                while ($nextProfileIndex -lt $total -and $jobs.Count -lt $maxThreadsEffective) {
-                    $profileItem = $Profiles[$nextProfileIndex]
+                while ($ranges.Count -gt 0 -and $jobs.Count -lt $maxThreadsEffective) {
+                    $range = $ranges.Pop()
+                    while ($range.Count -gt 1) {
+                        $leftCount = [int][math]::Floor($range.Count / 2)
+                        $ranges.Push([PSCustomObject]@{
+                                Phase = $range.Phase; Start = $range.Start + $leftCount
+                                Count = $range.Count - $leftCount; Context = $range.Context
+                            })
+                        $range = [PSCustomObject]@{
+                            Phase = $range.Phase; Start = $range.Start; Count = $leftCount; Context = $range.Context
+                        }
+                    }
+
+                    $folder = $null
+                    $startTime = [datetime]::MinValue
+                    if ($range.Phase -eq 'Prepare') {
+                        $profileItem = $Profiles[$range.Start]
+                        $profileIndex = $range.Start
+                    }
+                    else {
+                        $profileIndex = $range.Context.Index
+                        $startTime = $range.Context.Start
+                        if ($range.Phase -eq 'Folder') {
+                            $path = $range.Context.Paths[$range.Start]
+                            $profileItem = [PSCustomObject]@{ LocalPath = $path; SID = $null }
+                            $folder = [PSCustomObject]@{ Name = [System.IO.Path]::GetFileName($path); Path = $path }
+                        }
+                        else {
+                            $profileItem = $range.Context.Profile
+                        }
+                    }
+
                     $ps = [PowerShell]::Create()
                     $pendingPowerShell = $ps
                     $ps.RunspacePool = $pool
 
                     [void]$ps.AddScript($scriptBlock, $true).
-                    AddArgument($profileItem)
+                    AddArgument($profileItem).
+                    AddArgument($range.Phase).
+                    AddArgument($startTime)
 
                     $handle = $ps.BeginInvoke()
 
@@ -465,11 +603,13 @@ function WinDeleteUserProfiles {
                             PowerShell = $ps
                             Handle     = $handle
                             Profile    = $profileItem
-                            Index      = $nextProfileIndex
+                            Folder     = $folder
+                            Index      = $profileIndex
+                            Phase      = $range.Phase
+                            Context    = $range.Context
                         })
                     # Transfer cleanup ownership only after the new job has been registered successfully.
                     $pendingPowerShell = $null
-                    $nextProfileIndex++
                 }
 
                 $percent = if ($total -gt 0) { [math]::Floor(($completed / $total) * 100) } else { 100 }
@@ -485,7 +625,7 @@ function WinDeleteUserProfiles {
                     $waitHandles = [System.Threading.WaitHandle[]]@($jobs | ForEach-Object { $_.Handle.AsyncWaitHandle })
                     [void][System.Threading.WaitHandle]::WaitAny($waitHandles, 500)
                 }
-            } while ($completed -lt $total)
+            }
 
             Write-ProgressUpdate -Activity (Get-SourceTextLoc 'toolText.extra.removingRegisteredProfiles') -Status (Get-SourceTextLoc 'uiText.completed') -Percent 100 -Icon '✅'
             Clear-ProgressLine

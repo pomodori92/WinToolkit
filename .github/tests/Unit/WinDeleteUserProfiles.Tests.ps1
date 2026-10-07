@@ -20,6 +20,7 @@ Describe 'Issue #189 safe regressions' {
             @{ Path = $toolPath; Name = 'New-ProfileRemovalSessionState' },
             @{ Path = $toolPath; Name = 'Receive-ProfileRemovalResult' },
             @{ Path = $toolPath; Name = 'Close-ProfileRemovalPowerShell' },
+            @{ Path = $toolPath; Name = 'Get-ProfileCleanupSubtrees' },
             @{ Path = $toolPath; Name = 'Remove-ProfileRegistryEntries' },
             @{ Path = $toolPath; Name = 'Remove-ResidualUserFolder' },
             @{ Path = $toolPath; Name = 'Remove-ResidualUserFolders' },
@@ -60,6 +61,7 @@ Describe 'Issue #189 safe regressions' {
         }, $true)
         $script:ProfileRemovalWorker = $workerExpression.ScriptBlock.GetScriptBlock()
         $script:ProfileRemovalBatchDefinition = $batchFunction.Extent.Text
+        $script:ProfileRemovalBatchInvoker = $batchFunction.Body.GetScriptBlock()
         $script:ProfileRemovalWorkerOffset = $workerAssignment.Extent.StartOffset - $batchFunction.Extent.StartOffset
         $script:ProfileRemovalWorkerLength = $workerAssignment.Extent.EndOffset - $workerAssignment.Extent.StartOffset
         $script:ProfileBatchResultReceiver = (Get-Command Receive-ProfileRemovalResult).ScriptBlock
@@ -242,19 +244,29 @@ Describe 'Issue #189 safe regressions' {
         BeforeEach {
             $script:ProbeFolderPath = Join-Path $TestDrive 'Issue189[Probe]'
             [void][System.IO.Directory]::CreateDirectory($script:ProbeFolderPath)
-            $script:ProbeProfile = [pscustomobject]@{
-                LocalPath = $script:ProbeFolderPath
-                SID = 'S-1-5-21-189-1'
+            # Preserve the cmdlet's input type so Pester observes CIM calls instead of binding failures.
+            $script:ProbeProfile = [Microsoft.Management.Infrastructure.CimInstance]::new('Win32_UserProfile')
+            foreach ($property in @(
+                    @{ Name = 'LocalPath'; Value = $script:ProbeFolderPath },
+                    @{ Name = 'SID'; Value = 'S-1-5-21-189-1' }
+                )) {
+                $script:ProbeProfile.CimInstanceProperties.Add(
+                    [Microsoft.Management.Infrastructure.CimProperty]::Create($property.Name, $property.Value,
+                        [Microsoft.Management.Infrastructure.CimType]::String, [Microsoft.Management.Infrastructure.CimFlags]::None)
+                )
             }
             $script:RemovalAttempts = 0
             Mock Remove-CimInstance { throw 'Synthetic CIM removal failure' }
             Mock Remove-ProfileRegistryEntries { $true }
             Mock Invoke-ExternalCommandWithLog { [pscustomobject]@{ Success = $true; ExitCode = 0 } }
             Mock Remove-ItemSafely { $false }
+            Mock Remove-Item { throw 'Unconfigured deletion probe' }
             Mock Test-Path { $true } -ParameterFilter { $Path -eq (Join-Path $env:TEMP 'EmptyFolder') }
             Mock Clear-ProgressLine {}
             Mock Write-ProgressUpdate {}
         }
+
+        AfterEach { $script:ProbeProfile.Dispose() }
 
         It 'recovers with ACL reset when the first literal folder removal fails' {
             Mock Remove-Item {
@@ -282,16 +294,84 @@ Describe 'Issue #189 safe regressions' {
             Should -Invoke Remove-ItemSafely -Times 0 -Exactly
         }
 
-        It 'reports failure and preserves the registry when both folder removal attempts fail' {
+        It 'reports failure and preserves the registry in <Phase> when both folder removal attempts fail' -ForEach @(
+            @{ Phase = 'Complete' }, @{ Phase = 'Finalize' }
+        ) {
             Mock Remove-Item { throw 'Synthetic access denied' }
 
-            $result = & $script:ProfileRemovalWorker $script:ProbeProfile
+            $result = & $script:ProfileRemovalWorker $script:ProbeProfile $Phase
 
             $result.Success | Should -BeFalse
             [System.IO.Directory]::Exists($script:ProbeFolderPath) | Should -BeTrue
             Should -Invoke Remove-Item -Times 2 -Exactly
             Should -Invoke Remove-ProfileRegistryEntries -Times 0 -Exactly
             Get-Content -LiteralPath $Global:CurrentLogFile -Raw | Should -Match '\[ERROR\].*Synthetic access denied'
+        }
+
+        It 'prepares remaining profile contents without starting filesystem or registry cleanup' {
+            $result = & $script:ProfileRemovalWorker $script:ProbeProfile 'Prepare'
+
+            $result.Type | Should -Be 'ProfilePreparation'
+            $result.Start | Should -BeOfType ([datetime])
+            Should -Invoke Remove-CimInstance -Times 1 -Exactly
+            Should -Invoke Remove-Item -Times 0 -Exactly
+            Should -Invoke Invoke-ExternalCommandWithLog -Times 0 -Exactly
+            Should -Invoke Remove-ProfileRegistryEntries -Times 0 -Exactly
+        }
+
+        It 'finishes in preparation when CIM has already removed the folder' {
+            Mock Remove-CimInstance { [System.IO.Directory]::Delete($script:ProbeFolderPath) }
+
+            $result = & $script:ProfileRemovalWorker $script:ProbeProfile 'Prepare'
+
+            $result.Type | Should -Be 'Profile'
+            $result.Success | Should -BeTrue
+            Should -Invoke Remove-Item -Times 0 -Exactly
+            Should -Invoke Remove-ProfileRegistryEntries -Times 1 -Exactly
+        }
+
+        It 'removes a child subtree without repeating CIM or touching profile registration' {
+            Mock Remove-Item {
+                if ($LiteralPath -ne $script:ProbeFolderPath) { throw 'Unexpected deletion target' }
+                [System.IO.Directory]::Delete($LiteralPath)
+            }
+
+            $result = & $script:ProfileRemovalWorker $script:ProbeProfile 'Folder'
+
+            $result.Type | Should -Be 'ResidualFolder'
+            $result.Path | Should -Be $script:ProbeFolderPath
+            $result.Success | Should -BeTrue
+            Should -Invoke Remove-CimInstance -Times 0 -Exactly
+            Should -Invoke Remove-ProfileRegistryEntries -Times 0 -Exactly
+            Should -Invoke Remove-Item -Times 1 -Exactly -ParameterFilter { $LiteralPath -eq $script:ProbeFolderPath }
+        }
+
+        It 'skips a child that has become a reparse point after partitioning' {
+            Mock Get-Item { [pscustomobject]@{ Attributes = [System.IO.FileAttributes]::ReparsePoint } }
+
+            $result = & $script:ProfileRemovalWorker $script:ProbeProfile 'Folder'
+
+            $result.Success | Should -BeFalse
+            Should -Invoke Remove-Item -Times 0 -Exactly
+            Should -Invoke Invoke-ExternalCommandWithLog -Times 0 -Exactly
+            Should -Invoke Remove-ProfileRegistryEntries -Times 0 -Exactly
+        }
+
+        It 'finalizes the root with the original start time and without repeating CIM removal' {
+            Mock Remove-Item {
+                if ($LiteralPath -ne $script:ProbeFolderPath) { throw 'Unexpected deletion target' }
+                [System.IO.Directory]::Delete($LiteralPath)
+            }
+            $start = (Get-Date).AddSeconds(-10)
+
+            $result = & $script:ProfileRemovalWorker $script:ProbeProfile 'Finalize' $start
+
+            $result.Type | Should -Be 'Profile'
+            $result.Sid | Should -Be $script:ProbeProfile.SID
+            $result.Success | Should -BeTrue
+            $result.Duration.TotalSeconds | Should -BeGreaterOrEqual 10
+            Should -Invoke Remove-CimInstance -Times 0 -Exactly
+            Should -Invoke Remove-ProfileRegistryEntries -Times 1 -Exactly
         }
 
         It 'checks the remaining registry entry even when CIM reported success' {
@@ -365,17 +445,96 @@ Describe 'Issue #189 safe regressions' {
         }
     }
 
+    Context 'Profile subtree planning without deletion' {
+        BeforeEach {
+            $script:PlanRoot = 'C:\Users\Plan[Profile]'
+            $script:PlanTree = @{
+                $script:PlanRoot = @(
+                    [pscustomobject]@{ FullName = "$script:PlanRoot\AppData"; Attributes = [System.IO.FileAttributes]::Directory },
+                    [pscustomobject]@{ FullName = "$script:PlanRoot\Documents"; Attributes = [System.IO.FileAttributes]::Directory },
+                    [pscustomobject]@{ FullName = "$script:PlanRoot\Junction"; Attributes = [System.IO.FileAttributes]::ReparsePoint }
+                )
+                "$script:PlanRoot\AppData" = @(
+                    [pscustomobject]@{ FullName = "$script:PlanRoot\AppData\Local"; Attributes = [System.IO.FileAttributes]::Directory },
+                    [pscustomobject]@{ FullName = "$script:PlanRoot\AppData\Roaming"; Attributes = [System.IO.FileAttributes]::Directory },
+                    [pscustomobject]@{ FullName = "$script:PlanRoot\AppData\Link"; Attributes = [System.IO.FileAttributes]::ReparsePoint }
+                )
+                "$script:PlanRoot\Documents" = @()
+            }
+            Mock Get-Item { [pscustomobject]@{ Attributes = [System.IO.FileAttributes]::Directory } }
+            Mock Get-ChildItem { foreach ($entry in $script:PlanTree[$LiteralPath]) { $entry } }
+        }
+
+        It 'returns disjoint child paths and never traverses a reparse point or enumerates files' {
+            $paths = @(Get-ProfileCleanupSubtrees -Path $script:PlanRoot)
+
+            $paths.Count | Should -Be 3
+            $paths[0] | Should -Be "$script:PlanRoot\AppData\Local"
+            $paths[1] | Should -Be "$script:PlanRoot\AppData\Roaming"
+            $paths[2] | Should -Be "$script:PlanRoot\Documents"
+            $paths | Should -Not -Contain "$script:PlanRoot\AppData"
+            Should -Invoke Get-ChildItem -Times 3 -Exactly -ParameterFilter {
+                $Directory -and $Force -and $ErrorAction -eq 'Stop' -and $LiteralPath -notlike '*\Junction'
+            }
+            Should -Invoke Get-ChildItem -Times 0 -Exactly -ParameterFilter { $LiteralPath -like '*\Link' -or $LiteralPath -like '*\Junction' }
+        }
+
+        It 'leaves a reparse profile root to the original final cleanup' {
+            Mock Get-Item { [pscustomobject]@{ Attributes = [System.IO.FileAttributes]::ReparsePoint } }
+
+            @(Get-ProfileCleanupSubtrees -Path $script:PlanRoot).Count | Should -Be 0
+
+            Should -Invoke Get-ChildItem -Times 0 -Exactly
+        }
+
+        It 'falls back to whole-profile cleanup when root enumeration fails' {
+            Mock Get-ChildItem { throw 'Synthetic root enumeration failure' }
+
+            @(Get-ProfileCleanupSubtrees -Path $script:PlanRoot).Count | Should -Be 0
+
+            Get-Content -LiteralPath $Global:CurrentLogFile -Raw | Should -Match 'Synthetic root enumeration failure'
+        }
+
+        It 'uses the inaccessible child as one leaf without losing its siblings' {
+            Mock Get-ChildItem { throw 'Synthetic child enumeration failure' } -ParameterFilter { $LiteralPath -like '*\AppData' }
+
+            $paths = @(Get-ProfileCleanupSubtrees -Path $script:PlanRoot)
+
+            $paths.Count | Should -Be 2
+            $paths | Should -Contain "$script:PlanRoot\AppData"
+            $paths | Should -Contain "$script:PlanRoot\Documents"
+            Get-Content -LiteralPath $Global:CurrentLogFile -Raw | Should -Match 'Synthetic child enumeration failure'
+        }
+    }
+
     Context 'Bounded profile scheduling with synthetic workers' {
         BeforeAll {
             $syntheticWorker = @'
 $scriptBlock = {
-    param($ProfileItem)
+    param($ProfileItem, $Phase = 'Complete', $StartTime = [datetime]::MinValue)
+    $ProfileSchedulingEvents.Enqueue("${Phase}:$($ProfileItem.LocalPath)")
+    if ($Phase -eq 'Folder') {
+        if ($ProfileSchedulingGate) {
+            [void]$ProfileSchedulingGate.Signal()
+            if (-not $ProfileSchedulingGate.Wait(5000)) { throw 'Synthetic children did not run concurrently' }
+        }
+        Start-Sleep -Milliseconds 5
+        $ProfileSchedulingEvents.Enqueue("Folder-End:$($ProfileItem.LocalPath)")
+        if ($ProfileItem.LocalPath.EndsWith('\Fail')) { throw 'Synthetic subtree failure' }
+        return [pscustomobject]@{ Type = 'ResidualFolder'; Success = $true }
+    }
     Start-Sleep -Milliseconds $ProfileItem.DelayMilliseconds
     if ($ProfileItem.Fail) { throw 'Synthetic bounded-worker failure' }
+    if ($Phase -eq 'Prepare' -and $ProfileItem.Remaining) {
+        return [pscustomobject]@{ Type = 'ProfilePreparation'; Start = (Get-Date).AddSeconds(-1) }
+    }
     [pscustomobject]@{
         Type = 'Profile'
         UserName = $ProfileItem.Name
-        Success = $true
+        Path = $ProfileItem.LocalPath
+        Sid = $ProfileItem.SID
+        Success = -not $ProfileItem.FinalFail
+        Started = $StartTime
         Duration = [TimeSpan]::Zero
     }
 }
@@ -418,12 +577,25 @@ $scriptBlock = {
             $script:BatchPeakOutstanding = 0
             $script:BatchReceivedNames = [System.Collections.Generic.List[string]]::new()
             $script:BatchProgress = [System.Collections.Generic.List[int]]::new()
-            Mock New-ProfileRemovalSessionState { [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault() }
+            $script:BatchEvents = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+            $script:BatchGate = $null
+            $script:BatchSubtrees = @{}
+            Mock New-ProfileRemovalSessionState {
+                $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+                foreach ($entry in @(
+                        @{ Name = 'ProfileSchedulingEvents'; Value = $script:BatchEvents },
+                        @{ Name = 'ProfileSchedulingGate'; Value = $script:BatchGate }
+                    )) {
+                    $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new($entry.Name, $entry.Value, ''))
+                }
+                return $sessionState
+            }
+            Mock Get-ProfileCleanupSubtrees { $script:BatchSubtrees[$Path] }
             Mock Write-ProgressUpdate { $script:BatchProgress.Add($Percent) }
             Mock Clear-ProgressLine {}
             Mock Receive-ProfileRemovalResult {
                 $script:BatchReceivedNames.Add([System.IO.Path]::GetFileName($Job.Profile.LocalPath))
-                $result = & $script:ProfileBatchResultReceiver -Job $Job
+                $result = & $script:ProfileBatchResultReceiver -Job $Job -ResultType $ResultType
                 $script:BatchCollectedCount++
                 $result
             }
@@ -431,6 +603,188 @@ $scriptBlock = {
 
         AfterEach {
             foreach ($powerShell in $script:BatchCreatedPowerShells) { $powerShell.Dispose() }
+        }
+
+        It 'completes an empty profile batch without allocating workers or a pool' {
+            $maxThreadsEffective = 4
+
+            @(Invoke-ProfileRemovalBatch -Profiles @()).Count | Should -Be 0
+
+            $script:BatchCreatedPowerShells.Count | Should -Be 0
+            Should -Invoke New-ProfileRemovalSessionState -Times 0 -Exactly
+            Should -Invoke Clear-ProgressLine -Times 1 -Exactly
+        }
+
+        It 'runs two children of one profile concurrently and finalizes after both finish' {
+            $maxThreadsEffective = 2
+            $script:BatchGate = [System.Threading.CountdownEvent]::new(2)
+            $profile = [pscustomobject]@{
+                Name = 'Split'; LocalPath = 'C:\Users\Split'; SID = 'split'; DelayMilliseconds = 1; Remaining = $true
+            }
+            $script:BatchSubtrees[$profile.LocalPath] = @('C:\Users\Split\Left', 'C:\Users\Split\Right')
+            try {
+                $results = @(Invoke-ProfileRemovalBatch -Profiles @($profile))
+
+                $script:BatchGate.CurrentCount | Should -Be 0
+                $script:BatchPeakOutstanding | Should -Be 2
+                $script:BatchCreatedPowerShells.Count | Should -Be 4
+                $results.Count | Should -Be 1
+                $results[0].Success | Should -BeTrue
+                $results[0].Path | Should -Be $profile.LocalPath
+                $results[0].Sid | Should -Be $profile.SID
+                $results[0].Started | Should -BeLessThan (Get-Date).AddMilliseconds(-500)
+                $events = $script:BatchEvents.ToArray()
+                $events[-1] | Should -Be 'Finalize:C:\Users\Split'
+                @($events | Where-Object { $_ -like 'Folder-End:*' }).Count | Should -Be 2
+                Should -Invoke New-ProfileRemovalSessionState -Times 1 -Exactly
+                foreach ($powerShell in $script:BatchCreatedPowerShells) { Assert-ProfileProbePowerShellDisposed -PowerShell $powerShell }
+            }
+            finally { $script:BatchGate.Dispose() }
+        }
+
+        It 'dispatches real worker phases and removes registration only after the empty fixture root is gone' {
+            $maxThreadsEffective = 2
+            $root = Join-Path $TestDrive 'Phased[Profile]'
+            $children = @((Join-Path $root 'Left'), (Join-Path $root 'Right'))
+            foreach ($path in $children) { [void][System.IO.Directory]::CreateDirectory($path) }
+            $profile = [pscustomobject]@{ LocalPath = $root; SID = 'fixture-sid' }
+            $script:BatchSubtrees[$root] = $children
+            $targets = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($path in @($root) + $children) { [void]$targets.Add($path) }
+            Mock New-ProfileRemovalSessionState {
+                $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+                $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('FixtureTargets', $targets, ''))
+                $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('FixtureRoot', $root, ''))
+                $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('FixtureEvents', $script:BatchEvents, ''))
+                $stubs = @{
+                    'Remove-CimInstance' = @'
+[CmdletBinding()] param($InputObject, [switch]$Confirm)
+$FixtureEvents.Enqueue("CIM:$($InputObject.LocalPath)")
+throw 'Synthetic CIM leftovers'
+'@
+                    'Remove-Item' = @'
+[CmdletBinding()] param([string]$LiteralPath, [switch]$Recurse, [switch]$Force, [switch]$Confirm)
+if (-not $FixtureTargets.Contains($LiteralPath)) { throw 'Unexpected fixture deletion target' }
+# The non-recursive API can delete only the explicitly allowed, empty fixture directories.
+[System.IO.Directory]::Delete($LiteralPath)
+$FixtureEvents.Enqueue("Removed:$LiteralPath")
+'@
+                    'Remove-ProfileRegistryEntries' = @'
+param($Sid, $UserName)
+if ([System.IO.Directory]::Exists($FixtureRoot)) { throw 'Registry cleanup preceded parent removal' }
+$FixtureEvents.Enqueue("Registry:$Sid")
+$true
+'@
+                    'Invoke-ExternalCommandWithLog' = 'param($Command, $Arguments, $LogContextKey)'
+                    'Write-ToolkitLog' = 'param($Level, $Message)'
+                    'Get-SourceTextLoc' = 'param($Key, $Args) $Key'
+                    'Test-Path' = 'param($Path) $true'
+                    'Get-Item' = '[CmdletBinding()] param($LiteralPath, [switch]$Force) [pscustomobject]@{ Attributes = [System.IO.FileAttributes]::Directory }'
+                }
+                foreach ($name in $stubs.Keys) {
+                    $sessionState.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($name, $stubs[$name]))
+                }
+                return $sessionState
+            }
+
+            $results = @(& $script:ProfileRemovalBatchInvoker -Profiles @($profile))
+
+            $results.Count | Should -Be 1
+            $results[0].Success | Should -BeTrue
+            $results[0].Path | Should -Be $root
+            $results[0].Sid | Should -Be 'fixture-sid'
+            [System.IO.Directory]::Exists($root) | Should -BeFalse
+            $events = $script:BatchEvents.ToArray()
+            @($events | Where-Object { $_ -like 'CIM:*' }).Count | Should -Be 1
+            @($events | Where-Object { $_ -like 'Removed:*' }).Count | Should -Be 3
+            $events[-2] | Should -Be "Removed:$root"
+            $events[-1] | Should -Be 'Registry:fixture-sid'
+        }
+
+        It 'uses a global cap of <Threads> across odd child counts and combines profiles in input order' -ForEach @(
+            @{ Threads = 1 }, @{ Threads = 4 }
+        ) {
+            $maxThreadsEffective = $Threads
+            $profiles = @(for ($index = 0; $index -lt 3; $index++) {
+                $profile = [pscustomobject]@{
+                    Name = "Split$index"; LocalPath = "C:\Users\Split$index"; SID = "split$index"; DelayMilliseconds = 1; Remaining = $true
+                }
+                $script:BatchSubtrees[$profile.LocalPath] = @(for ($child = 0; $child -lt 5; $child++) { "$($profile.LocalPath)\Child$child" })
+                $profile
+            })
+
+            $results = @(Invoke-ProfileRemovalBatch -Profiles $profiles)
+
+            $script:BatchPeakOutstanding | Should -BeLessOrEqual $Threads
+            $script:BatchCreatedPowerShells.Count | Should -Be 21
+            $script:BatchCollectedCount | Should -Be 21
+            $results.Count | Should -Be 3
+            for ($index = 0; $index -lt 3; $index++) {
+                $results[$index].Path | Should -Be $profiles[$index].LocalPath
+                $results[$index].Sid | Should -Be $profiles[$index].SID
+            }
+            $events = $script:BatchEvents.ToArray()
+            @($events | Where-Object { $_ -like 'Folder:*' } | Sort-Object -Unique).Count | Should -Be 15
+            foreach ($profile in $profiles) {
+                $finalIndex = [array]::IndexOf($events, "Finalize:$($profile.LocalPath)")
+                foreach ($path in $script:BatchSubtrees[$profile.LocalPath]) {
+                    [array]::IndexOf($events, "Folder-End:$path") | Should -BeLessThan $finalIndex
+                }
+            }
+            Should -Invoke New-ProfileRemovalSessionState -Times 1 -Exactly
+        }
+
+        It 'attempts root recovery after a failed child and counts only the final profile result' {
+            $maxThreadsEffective = 2
+            $profile = [pscustomobject]@{
+                Name = 'Recovery'; LocalPath = 'C:\Users\Recovery'; SID = 'recovery'; DelayMilliseconds = 1; Remaining = $true
+            }
+            $script:BatchSubtrees[$profile.LocalPath] = @('C:\Users\Recovery\Fail', 'C:\Users\Recovery\Next')
+
+            $results = @(Invoke-ProfileRemovalBatch -Profiles @($profile))
+
+            $results.Count | Should -Be 1
+            $results[0].Success | Should -BeTrue
+            $script:BatchCollectedCount | Should -Be 4
+            $script:BatchEvents.ToArray()[-1] | Should -Be 'Finalize:C:\Users\Recovery'
+            Get-Content -LiteralPath $Global:CurrentLogFile -Raw | Should -Match '\[ERROR\].*Synthetic subtree failure'
+            $script:BatchProgress[0] | Should -Be 0
+            $script:BatchProgress[-1] | Should -Be 100
+        }
+
+        It 'disposes all workers if a child fails to start after profile preparation succeeded' {
+            $maxThreadsEffective = 2
+            $profile = [pscustomobject]@{
+                Name = 'ChildStartup'; LocalPath = 'C:\Users\ChildStartup'; SID = 'childStartup'; DelayMilliseconds = 1; Remaining = $true
+            }
+            $script:BatchSubtrees[$profile.LocalPath] = @('C:\Users\ChildStartup\Left', 'C:\Users\ChildStartup\Right')
+            Mock Invoke-ProfileProbeBeginInvoke {
+                if ($script:BatchCreatedPowerShells.Count -eq 3) { throw 'Synthetic child startup failure' }
+                $PowerShell.BeginInvoke()
+            }
+
+            { Invoke-ProfileRemovalBatch -Profiles @($profile) } | Should -Throw '*Synthetic child startup failure*'
+
+            $script:BatchCreatedPowerShells.Count | Should -Be 3
+            $script:BatchCollectedCount | Should -Be 1
+            foreach ($powerShell in $script:BatchCreatedPowerShells) { Assert-ProfileProbePowerShellDisposed -PowerShell $powerShell }
+        }
+
+        It 'uses whole-root finalization without child pipelines for <Count> planned subtrees' -ForEach @(
+            @{ Count = 0 }, @{ Count = 1 }
+        ) {
+            $maxThreadsEffective = 2
+            $profile = [pscustomobject]@{
+                Name = 'Small'; LocalPath = 'C:\Users\Small'; SID = 'small'; DelayMilliseconds = 1; Remaining = $true; FinalFail = $true
+            }
+            $script:BatchSubtrees[$profile.LocalPath] = @(for ($child = 0; $child -lt $Count; $child++) { "C:\Users\Small\Child$child" })
+
+            $results = @(Invoke-ProfileRemovalBatch -Profiles @($profile))
+
+            $script:BatchCreatedPowerShells.Count | Should -Be 2
+            $results.Count | Should -Be 1
+            $results[0].Success | Should -BeFalse
+            @($script:BatchEvents.ToArray() | Where-Object { $_ -like 'Folder:*' }).Count | Should -Be 0
         }
 
         It 'limits <Count> profiles to <Threads> outstanding jobs and preserves every result' -ForEach @(
