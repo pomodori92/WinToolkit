@@ -215,6 +215,111 @@ function WinDeleteUserProfiles {
         }
     }
 
+    # Cleanup commands need bounded capture: recursive ACL tools can print one line for every file.
+    function Invoke-ProfileCleanupCommand {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory = $true)]
+            [string]$Command,
+            [string[]]$Arguments = @(),
+            [string]$LogContextKey = ''
+        )
+
+        Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'uiText.commandContext') -Context @{
+            Command = $Command; Arguments = $Arguments; ContextKey = $LogContextKey
+        }
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $Command
+        $startInfo.Arguments = $Arguments -join ' '
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.CreateNoWindow = $true
+        $process = [System.Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        $timer = [System.Diagnostics.Stopwatch]::StartNew()
+        $started = $false
+        $exitCode = -1
+        $streams = @()
+
+        try {
+            $started = $process.Start()
+            if (-not $started) { throw (Get-SourceTextLoc 'uiText.unableToStartExternalProcess') }
+            foreach ($reader in @($process.StandardOutput, $process.StandardError)) {
+                $buffer = [char[]]::new(4096)
+                $streams += [PSCustomObject]@{
+                    Reader = $reader; Buffer = $buffer; Text = [System.Text.StringBuilder]::new(8000)
+                    Read = $reader.ReadAsync($buffer, 0, $buffer.Length); Ended = $false; Truncated = $false
+                }
+            }
+
+            # Drain both pipes even after their snippets are full, so a noisy process cannot block on output.
+            while ($true) {
+                $readAvailable = $false
+                foreach ($stream in $streams) {
+                    if ($stream.Ended -or -not $stream.Read.IsCompleted) { continue }
+                    $readAvailable = $true
+                    $count = $stream.Read.GetAwaiter().GetResult()
+                    if ($count -eq 0) {
+                        $stream.Ended = $true
+                        $stream.Read = $null
+                        continue
+                    }
+                    $retain = [Math]::Min($count, 8000 - $stream.Text.Length)
+                    if ($retain -gt 0) { [void]$stream.Text.Append($stream.Buffer, 0, $retain) }
+                    if ($retain -lt $count) { $stream.Truncated = $true }
+                    $stream.Read = $stream.Reader.ReadAsync($stream.Buffer, 0, $stream.Buffer.Length)
+                }
+                if ($process.HasExited -and $streams[0].Ended -and $streams[1].Ended) {
+                    $exitCode = $process.ExitCode
+                    break
+                }
+                # Short waits let PowerShell cancellation reach finally instead of blocking in WaitForExit().
+                if (-not $readAvailable) {
+                    $pendingReads = [System.Threading.Tasks.Task[]]@($streams | Where-Object { -not $_.Ended } | ForEach-Object { $_.Read })
+                    if ($pendingReads.Count -gt 0) { [void][System.Threading.Tasks.Task]::WaitAny($pendingReads, 20) }
+                    else { [System.Threading.Thread]::Sleep(20) }
+                }
+            }
+        }
+        catch [System.Management.Automation.PipelineStoppedException] { throw }
+        catch {
+            Write-ToolkitLog -Level 'ERROR' -Message (Get-SourceTextLoc 'uiText.exceptionWhileRunningExternalCommand') -Context @{
+                Command = $Command; Arguments = $Arguments
+                ContextKey = $LogContextKey; Exception = $_.Exception.Message; Stack = $_.ScriptStackTrace
+            }
+        }
+        finally {
+            # Cancellation can bypass catch; always terminate this invocation's child before releasing its pipes.
+            try {
+                if ($started -and -not $process.HasExited) {
+                    try { $process.Kill() }
+                    catch { Write-Warning -Message $_.Exception.Message -WarningAction Continue }
+                    [void]$process.WaitForExit(1000)
+                }
+            }
+            finally {
+                try { foreach ($stream in $streams) { $stream.Reader.Dispose() } }
+                finally { $process.Dispose(); $timer.Stop() }
+            }
+        }
+
+        $outText = if ($streams.Count -gt 0) { $streams[0].Text.ToString() } else { '' }
+        $errText = if ($streams.Count -gt 1) { $streams[1].Text.ToString() } else { '' }
+        if ($streams.Count -gt 0 -and $streams[0].Truncated) { $outText += "`n[...output truncated...]" }
+        if ($streams.Count -gt 1 -and $streams[1].Truncated) { $errText += "`n[...stderr truncated...]" }
+        $success = $exitCode -eq 0
+        $status = if ($success) { Get-SourceTextLoc 'sourceText.completedSuccessfully' } else { Get-SourceTextLoc 'sourceText.completedWithErrors' }
+        Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'uiText.command0ExitCode1Duration2' -Args @($status, $exitCode, $timer.Elapsed.ToString('hh\:mm\:ss')))
+        Write-ToolkitLog -Level 'DEBUG' -Message (Get-SourceTextLoc 'uiText.commandOutput0' -Args @($Command)) -Context @{
+            ContextKey = $LogContextKey; StdOutSnippet = $outText; StdErrSnippet = $errText
+        }
+        [PSCustomObject]@{
+            Success = $success; ExitCode = $exitCode; StdOut = $outText; StdErr = $errText
+            Elapsed = $timer.Elapsed
+        }
+    }
+
     # Supply worker dependencies explicitly: runspaces do not inherit toolkit functions or language/log context.
     # Build this small, fixed dependency set once per pool; there is no bulk work to partition here.
     function New-ProfileRemovalSessionState {
@@ -223,7 +328,7 @@ function WinDeleteUserProfiles {
         foreach ($functionName in @(
                 'Get-SourceTextLoc',
                 'Write-ToolkitLog',
-                'Invoke-ExternalCommandWithLog',
+                'Invoke-ProfileCleanupCommand',
                 'Remove-ItemSafely',
                 'Remove-ProfileRegistryEntries',
                 'Remove-ResidualUserFolder',
@@ -302,20 +407,31 @@ function WinDeleteUserProfiles {
         finally {
             # Release command references and pipeline resources as soon as collection finishes.
             try { $Job.PowerShell.Commands.Clear() }
-            finally { $Job.PowerShell.Dispose() }
+            finally {
+                try { if ($Job.WaitHandle) { $Job.WaitHandle.Dispose() } }
+                finally { $Job.PowerShell.Dispose() }
+            }
         }
     }
 
     # Clean up workers abandoned by a batch failure while keeping individual cleanup errors non-terminating.
-    # Stop and Dispose form one ordered leaf operation and must finish before the owning pool closes.
+    # Stop, EndInvoke, and Dispose form one ordered leaf operation before the owning pool closes.
     function Close-ProfileRemovalPowerShell {
         param(
             [Parameter(Mandatory = $true)]
-            [object]$PowerShell
+            [object]$PowerShell,
+            [System.IAsyncResult]$Handle,
+            [System.Threading.WaitHandle]$WaitHandle
         )
 
         try {
             $PowerShell.Stop()
+            if ($Handle) {
+                # EndInvoke releases the async result's resources even when stopping made it throw.
+                try { [void]$PowerShell.EndInvoke($Handle) }
+                catch [System.Management.Automation.PipelineStoppedException] {}
+                catch [System.ObjectDisposedException] {}
+            }
         }
         # Collection may have disposed the instance before a later batch operation failed.
         catch [System.ObjectDisposedException] {}
@@ -326,7 +442,8 @@ function WinDeleteUserProfiles {
         finally {
             # Dispose must still run when Stop fails.
             try {
-                $PowerShell.Dispose()
+                try { if ($WaitHandle) { $WaitHandle.Dispose() } }
+                finally { $PowerShell.Dispose() }
             }
             catch {
                 Write-Warning -Message $_.Exception.Message -WarningAction Continue
@@ -334,17 +451,24 @@ function WinDeleteUserProfiles {
         }
     }
 
-    # Partition leftovers into disjoint directory subtrees without enumerating every file in a large profile.
+    # Native directory iterators avoid Get-ChildItem materializing a wide directory before yielding paths.
+    function New-ProfileDirectoryEnumerator {
+        param([Parameter(Mandatory = $true)][string]$Path)
+        return , ([System.IO.Directory]::EnumerateDirectories($Path).GetEnumerator())
+    }
+
+    # Partition leftovers into disjoint directory subtrees, keeping only the current branch in memory.
     function Get-ProfileCleanupSubtrees {
         param(
             [Parameter(Mandatory = $true)]
-            [string]$Path
+            [string]$Path,
+            [switch]$AsEnumerator
         )
 
         try {
             $root = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
             if ($root.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return }
-            $directories = @(Get-ChildItem -LiteralPath $Path -Directory -Force -ErrorAction Stop)
+            $directories = New-ProfileDirectoryEnumerator -Path $Path
         }
         catch {
             # Enumeration failure leaves the original whole-profile cleanup responsible for recovery.
@@ -352,26 +476,79 @@ function WinDeleteUserProfiles {
             return
         }
 
-        foreach ($directory in $directories) {
-            if ($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
-            try {
-                # A second level separates common AppData branches; parent files stay for finalization.
-                $children = @(Get-ChildItem -LiteralPath $directory.FullName -Directory -Force -ErrorAction Stop |
-                    Where-Object { -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) })
-            }
-            catch {
-                Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.standardFolderCleanupFailed01' -Args @($directory.FullName, $($_.Exception.Message)))
-                $children = @()
-            }
-
-            # Emit either the parent or its children, never both, so workers cannot delete overlapping paths.
-            if ($children.Count -gt 0) {
-                foreach ($child in $children) { $child.FullName }
-            }
-            else {
-                $directory.FullName
+        $cursor = [PSCustomObject]@{
+            Path = $Path; Directories = $directories; Children = $null
+            Branch = $null; BranchEmitted = $false; Current = $null; Disposed = $false
+        }
+        $cursor | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+            try { if ($this.Children -is [System.IDisposable]) { $this.Children.Dispose() } }
+            finally {
+                try { if ($this.Directories -is [System.IDisposable]) { $this.Directories.Dispose() } }
+                finally {
+                    $this.Children = $null; $this.Directories = $null; $this.Current = $null
+                    $this.Branch = $null; $this.Disposed = $true
+                }
             }
         }
+        $cursor | Add-Member -MemberType ScriptMethod -Name MoveNext -Value {
+            if ($this.Disposed) { return $false }
+            while ($true) {
+                if ($null -ne $this.Children) {
+                    try {
+                        while ($this.Children.MoveNext()) {
+                            $childPath = [string]$this.Children.Current
+                            $child = Get-Item -LiteralPath $childPath -Force -ErrorAction Stop
+                            if ($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+                            $this.BranchEmitted = $true
+                            $this.Current = $childPath
+                            return $true
+                        }
+                    }
+                    catch {
+                        Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.standardFolderCleanupFailed01' -Args @($this.Branch, $_.Exception.Message))
+                    }
+                    if ($this.Children -is [System.IDisposable]) { $this.Children.Dispose() }
+                    $this.Children = $null
+                    # Once any child was yielded, its parent must wait for root finalization to avoid overlap.
+                    if (-not $this.BranchEmitted) {
+                        $this.Current = $this.Branch
+                        return $true
+                    }
+                }
+
+                try {
+                    if (-not $this.Directories.MoveNext()) {
+                        $this.Dispose()
+                        return $false
+                    }
+                    $this.Branch = [string]$this.Directories.Current
+                }
+                catch {
+                    try {
+                        Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.standardFolderCleanupFailed01' -Args @($this.Path, $_.Exception.Message))
+                    }
+                    finally { $this.Dispose() }
+                    return $false
+                }
+                $this.BranchEmitted = $false
+                try {
+                    $directory = Get-Item -LiteralPath $this.Branch -Force -ErrorAction Stop
+                    if ($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+                    # A second level separates AppData branches; files in their parents remain for finalization.
+                    $this.Children = New-ProfileDirectoryEnumerator -Path $this.Branch
+                }
+                catch {
+                    Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.standardFolderCleanupFailed01' -Args @($this.Branch, $_.Exception.Message))
+                    $this.Current = $this.Branch
+                    return $true
+                }
+            }
+        }
+
+        if ($AsEnumerator) { return $cursor }
+        # Preserve the path-producing interface for callers that do not need incremental scheduling.
+        try { while ($cursor.MoveNext()) { $cursor.Current } }
+        finally { $cursor.Dispose() }
     }
 
     # Divide leftover subtrees in one shared pool, then combine them into one result per original profile.
@@ -386,7 +563,10 @@ function WinDeleteUserProfiles {
         $jobs = [System.Collections.Generic.List[object]]::new()
         # Keep ownership of a new instance until startup succeeds and it joins the tracked job list.
         $pendingPowerShell = $null
+        $pendingHandle = $null
+        $pendingWaitHandle = $null
         $pool = $null
+        $activePlans = [System.Collections.Generic.HashSet[object]]::new()
         $total = $Profiles.Count
         $results = [object[]]::new($total)
         $completed = 0
@@ -453,7 +633,7 @@ function WinDeleteUserProfiles {
                         [void][System.IO.Directory]::CreateDirectory($tempEmpty)
                     }
 
-                    Invoke-ExternalCommandWithLog -Command 'robocopy.exe' `
+                    Invoke-ProfileCleanupCommand -Command 'robocopy.exe' `
                         -Arguments @("`"$tempEmpty`"", "`"$userPath`"", '/MIR', '/XJ', '/R:1', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP') `
                         -LogContextKey "ProfileCleanup-Robocopy-$userName" | Out-Null
 
@@ -466,9 +646,9 @@ function WinDeleteUserProfiles {
 
                     # Repair ownership and access if permissions prevented standard folder removal.
                     try {
-                        Invoke-ExternalCommandWithLog -Command 'takeown.exe' -Arguments @('/F', "`"$userPath`"", '/R', '/D', 'Y') -LogContextKey "ProfileCleanup-TakeOwn-$userName" | Out-Null
+                        Invoke-ProfileCleanupCommand -Command 'takeown.exe' -Arguments @('/F', "`"$userPath`"", '/R', '/D', 'Y') -LogContextKey "ProfileCleanup-TakeOwn-$userName" | Out-Null
                         # S-1-5-32-544 - Fixed SID across Windows languages; avoids depending on localized group names.
-                        Invoke-ExternalCommandWithLog -Command 'icacls.exe' -Arguments @("`"$userPath`"", '/grant', '*S-1-5-32-544:F', '/T', '/C') -LogContextKey "ProfileCleanup-Icacls-$userName" | Out-Null
+                        Invoke-ProfileCleanupCommand -Command 'icacls.exe' -Arguments @("`"$userPath`"", '/grant', '*S-1-5-32-544:F', '/T', '/C') -LogContextKey "ProfileCleanup-Icacls-$userName" | Out-Null
                         Remove-Item -LiteralPath $userPath -Recurse -Force -ErrorAction Stop -Confirm:$false
                         Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.folderRemovedAfterAclReset0' -Args @($userName))
                     }
@@ -532,22 +712,30 @@ function WinDeleteUserProfiles {
 
                     if ($job.Phase -eq 'Folder') {
                         $job.Context.Remaining--
-                        if ($job.Context.Remaining -eq 0) {
+                        if ($job.Context.Remaining -eq 0 -and $job.Context.EnumerationComplete) {
                             # Finalize this parent only after every child has been collected, including failures.
                             $ranges.Push([PSCustomObject]@{ Phase = 'Finalize'; Start = 0; Count = 1; Context = $job.Context })
                         }
                     }
                     elseif ($result.Type -eq 'ProfilePreparation') {
-                        $paths = @(Get-ProfileCleanupSubtrees -Path $job.Profile.LocalPath)
+                        $plan = Get-ProfileCleanupSubtrees -Path $job.Profile.LocalPath -AsEnumerator
+                        if ($plan) { [void]$activePlans.Add($plan) }
                         $context = [PSCustomObject]@{
                             Profile = $job.Profile; Index = $job.Index; Start = $result.Start
-                            Paths = $paths; Remaining = $paths.Count
+                            Plan = $plan; PendingPaths = [System.Collections.Generic.Queue[string]]::new()
+                            Remaining = 0; EnumerationComplete = $false
                         }
-                        if ($paths.Count -gt 1) {
-                            $ranges.Push([PSCustomObject]@{ Phase = 'Folder'; Start = 0; Count = $paths.Count; Context = $context })
+                        # Two-path lookahead preserves whole-root cleanup for small trees without retaining a manifest.
+                        if ($plan -and $plan.MoveNext()) { $context.PendingPaths.Enqueue($plan.Current) }
+                        if ($context.PendingPaths.Count -gt 0 -and $plan.MoveNext()) {
+                            $context.PendingPaths.Enqueue($plan.Current)
+                            $ranges.Push([PSCustomObject]@{ Phase = 'Enumerate'; Start = 0; Count = 1; Context = $context })
                         }
                         else {
-                            # Small or inaccessible trees use the original cleanup without extra child pipelines.
+                            if ($plan) { $plan.Dispose(); [void]$activePlans.Remove($plan) }
+                            $context.Plan = $null
+                            $context.PendingPaths.Clear()
+                            $context.EnumerationComplete = $true
                             $ranges.Push([PSCustomObject]@{ Phase = 'Finalize'; Start = 0; Count = 1; Context = $context })
                         }
                     }
@@ -574,6 +762,29 @@ function WinDeleteUserProfiles {
 
                     $folder = $null
                     $startTime = [datetime]::MinValue
+                    if ($range.Phase -eq 'Enumerate') {
+                        $context = $range.Context
+                        if ($context.PendingPaths.Count -gt 0) {
+                            $path = $context.PendingPaths.Dequeue()
+                        }
+                        elseif ($context.Plan.MoveNext()) {
+                            $path = $context.Plan.Current
+                        }
+                        else {
+                            $context.Plan.Dispose()
+                            [void]$activePlans.Remove($context.Plan)
+                            $context.Plan = $null
+                            $context.EnumerationComplete = $true
+                            if ($context.Remaining -gt 0) { continue }
+                            $range.Phase = 'Finalize'
+                        }
+                        if (-not $context.EnumerationComplete) {
+                            # Retain one continuation per profile and admit only the next disjoint leaf.
+                            $ranges.Push($range)
+                            $context.Remaining++
+                            $range = [PSCustomObject]@{ Phase = 'Folder'; Start = 0; Count = 1; Context = $context }
+                        }
+                    }
                     if ($range.Phase -eq 'Prepare') {
                         $profileItem = $Profiles[$range.Start]
                         $profileIndex = $range.Start
@@ -582,7 +793,6 @@ function WinDeleteUserProfiles {
                         $profileIndex = $range.Context.Index
                         $startTime = $range.Context.Start
                         if ($range.Phase -eq 'Folder') {
-                            $path = $range.Context.Paths[$range.Start]
                             $profileItem = [PSCustomObject]@{ LocalPath = $path; SID = $null }
                             $folder = [PSCustomObject]@{ Name = [System.IO.Path]::GetFileName($path); Path = $path }
                         }
@@ -601,10 +811,13 @@ function WinDeleteUserProfiles {
                     AddArgument($startTime)
 
                     $handle = $ps.BeginInvoke()
+                    $pendingHandle = $handle
+                    $pendingWaitHandle = $handle.AsyncWaitHandle
 
                     $jobs.Add([PSCustomObject]@{
                             PowerShell = $ps
                             Handle     = $handle
+                            WaitHandle = $pendingWaitHandle
                             Profile    = $profileItem
                             Folder     = $folder
                             Index      = $profileIndex
@@ -613,6 +826,8 @@ function WinDeleteUserProfiles {
                         })
                     # Transfer cleanup ownership only after the new job has been registered successfully.
                     $pendingPowerShell = $null
+                    $pendingHandle = $null
+                    $pendingWaitHandle = $null
                 }
 
                 $percent = if ($total -gt 0) { [math]::Floor(($completed / $total) * 100) } else { 100 }
@@ -624,9 +839,10 @@ function WinDeleteUserProfiles {
                 }
 
                 if ($jobs.Count -gt 0) {
-                    # Wait for any worker or a short timeout instead of continuously polling completion.
-                    $waitHandles = [System.Threading.WaitHandle[]]@($jobs | ForEach-Object { $_.Handle.AsyncWaitHandle })
+                    # Wait briefly for worker completion instead of continuously polling.
+                    $waitHandles = [System.Threading.WaitHandle[]]@($jobs | ForEach-Object { $_.WaitHandle })
                     [void][System.Threading.WaitHandle]::WaitAny($waitHandles, 500)
+                    $waitHandles = $null
                 }
             }
 
@@ -639,18 +855,27 @@ function WinDeleteUserProfiles {
             # Failure paths can bypass collection, leaving pending or tracked instances for this cleanup.
             try {
                 if ($pendingPowerShell) {
-                    Close-ProfileRemovalPowerShell -PowerShell $pendingPowerShell
+                    Close-ProfileRemovalPowerShell -PowerShell $pendingPowerShell -Handle $pendingHandle -WaitHandle $pendingWaitHandle
                 }
                 foreach ($job in $jobs) {
-                    Close-ProfileRemovalPowerShell -PowerShell $job.PowerShell
+                    Close-ProfileRemovalPowerShell -PowerShell $job.PowerShell -Handle $job.Handle -WaitHandle $job.WaitHandle
                 }
                 $jobs.Clear()
             }
             finally {
-                # Release the pool even after instance cleanup fails, and dispose it even if Close fails.
-                if ($pool) {
-                    try { $pool.Close() }
-                    finally { $pool.Dispose() }
+                try {
+                    foreach ($plan in $activePlans) {
+                        try { $plan.Dispose() }
+                        catch { Write-Warning -Message $_.Exception.Message -WarningAction Continue }
+                    }
+                }
+                finally {
+                    $activePlans.Clear()
+                    # Release the pool even after instance or iterator cleanup fails.
+                    if ($pool) {
+                        try { $pool.Close() }
+                        finally { $pool.Dispose() }
+                    }
                 }
             }
         }
@@ -757,9 +982,9 @@ function WinDeleteUserProfiles {
 
             # Retry with ownership and access repaired when normal filesystem deletion fails.
             try {
-                Invoke-ExternalCommandWithLog -Command 'takeown.exe' -Arguments @('/F', "`"$folderPath`"", '/R', '/D', 'Y') -LogContextKey "ResidualTakeOwn-$($folder.Name)" | Out-Null
+                Invoke-ProfileCleanupCommand -Command 'takeown.exe' -Arguments @('/F', "`"$folderPath`"", '/R', '/D', 'Y') -LogContextKey "ResidualTakeOwn-$($folder.Name)" | Out-Null
                 # S-1-5-32-544 - Fixed SID across Windows languages; avoids depending on localized group names.
-                Invoke-ExternalCommandWithLog -Command 'icacls.exe' -Arguments @("`"$folderPath`"", '/grant', '*S-1-5-32-544:F', '/T', '/C') -LogContextKey "ResidualIcacls-$($folder.Name)" | Out-Null
+                Invoke-ProfileCleanupCommand -Command 'icacls.exe' -Arguments @("`"$folderPath`"", '/grant', '*S-1-5-32-544:F', '/T', '/C') -LogContextKey "ResidualIcacls-$($folder.Name)" | Out-Null
                 Remove-Item -LiteralPath $folderPath -Recurse -Force -ErrorAction Stop -Confirm:$false
                 $success = -not [System.IO.Directory]::Exists($folderPath)
             }
@@ -799,6 +1024,8 @@ function WinDeleteUserProfiles {
         $results = [object[]]::new($total)
         $jobs = [System.Collections.Generic.List[object]]::new()
         $pendingPowerShell = $null
+        $pendingHandle = $null
+        $pendingWaitHandle = $null
         $pool = $null
         $completed = 0
         $lastPercent = -1
@@ -852,13 +1079,18 @@ function WinDeleteUserProfiles {
                     $ps.RunspacePool = $pool
                     [void]$ps.AddScript($scriptBlock, $true).AddArgument($folder)
                     $handle = $ps.BeginInvoke()
+                    $pendingHandle = $handle
+                    $pendingWaitHandle = $handle.AsyncWaitHandle
                     $jobs.Add([PSCustomObject]@{
                             PowerShell = $ps
                             Handle     = $handle
+                            WaitHandle = $pendingWaitHandle
                             Folder     = $folder
                             Index      = $range.Start
                         })
                     $pendingPowerShell = $null
+                    $pendingHandle = $null
+                    $pendingWaitHandle = $null
                 }
 
                 # Only the coordinator renders progress, using completed work rather than scheduled work.
@@ -869,8 +1101,9 @@ function WinDeleteUserProfiles {
                 }
 
                 if ($jobs.Count -gt 0) {
-                    $waitHandles = [System.Threading.WaitHandle[]]@($jobs | ForEach-Object { $_.Handle.AsyncWaitHandle })
+                    $waitHandles = [System.Threading.WaitHandle[]]@($jobs | ForEach-Object { $_.WaitHandle })
                     [void][System.Threading.WaitHandle]::WaitAny($waitHandles, 500)
+                    $waitHandles = $null
                 }
             }
 
@@ -883,10 +1116,10 @@ function WinDeleteUserProfiles {
         finally {
             try {
                 if ($pendingPowerShell) {
-                    Close-ProfileRemovalPowerShell -PowerShell $pendingPowerShell
+                    Close-ProfileRemovalPowerShell -PowerShell $pendingPowerShell -Handle $pendingHandle -WaitHandle $pendingWaitHandle
                 }
                 foreach ($job in $jobs) {
-                    Close-ProfileRemovalPowerShell -PowerShell $job.PowerShell
+                    Close-ProfileRemovalPowerShell -PowerShell $job.PowerShell -Handle $job.Handle -WaitHandle $job.WaitHandle
                 }
                 $jobs.Clear()
             }

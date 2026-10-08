@@ -20,6 +20,7 @@ Describe 'Issue #189 safe regressions' {
             @{ Path = $toolPath; Name = 'New-ProfileRemovalSessionState' },
             @{ Path = $toolPath; Name = 'Receive-ProfileRemovalResult' },
             @{ Path = $toolPath; Name = 'Close-ProfileRemovalPowerShell' },
+            @{ Path = $toolPath; Name = 'New-ProfileDirectoryEnumerator' },
             @{ Path = $toolPath; Name = 'Get-ProfileCleanupSubtrees' },
             @{ Path = $toolPath; Name = 'New-ProtectedNameSet' },
             @{ Path = $toolPath; Name = 'Get-RegisteredProfilePathSet' },
@@ -29,7 +30,7 @@ Describe 'Issue #189 safe regressions' {
             @{ Path = $toolPath; Name = 'Remove-ResidualUserFolders' },
             @{ Path = $localizationPath; Name = 'Get-SourceTextLoc' },
             @{ Path = $loggingPath; Name = 'Write-ToolkitLog' },
-            @{ Path = $processesPath; Name = 'Invoke-ExternalCommandWithLog' },
+            @{ Path = $toolPath; Name = 'Invoke-ProfileCleanupCommand' },
             @{ Path = $processesPath; Name = 'Remove-ItemSafely' },
             @{ Path = $uiPath; Name = 'Get-SpinnerChar' },
             @{ Path = $uiPath; Name = 'Write-StyledMessage' },
@@ -155,7 +156,7 @@ Describe 'Issue #189 safe regressions' {
                     LogPath = $Global:CurrentLogFile
                     ToolName = $Global:CurrentToolName
                     Helpers = @(
-                        'Get-SourceTextLoc', 'Write-ToolkitLog', 'Invoke-ExternalCommandWithLog',
+                        'Get-SourceTextLoc', 'Write-ToolkitLog', 'Invoke-ProfileCleanupCommand',
                         'Remove-ItemSafely', 'Remove-ProfileRegistryEntries', 'Remove-ResidualUserFolder', 'Get-SpinnerChar',
                         'Clear-ProgressLine', 'Write-ProgressUpdate'
                     ) | ForEach-Object { (Get-Command -Name $_ -CommandType Function -ErrorAction Stop).Name }
@@ -256,6 +257,86 @@ Describe 'Issue #189 safe regressions' {
         }
     }
 
+    Context 'Bounded native command capture with harmless child processes' {
+        BeforeAll {
+            $script:ProbeExecutable = (Get-Process -Id $PID).Path
+            function ConvertTo-ProfileProbeArguments {
+                param([string]$Code)
+                @('-NoLogo', '-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-EncodedCommand',
+                    [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('$ProgressPreference = ''SilentlyContinue''; ' + $Code)))
+            }
+        }
+
+        It 'drains megabytes on both pipes without retaining more than the diagnostic snippets' {
+            $arguments = ConvertTo-ProfileProbeArguments '[Console]::Out.Write((''o'' * 4194304)); [Console]::Error.Write((''e'' * 4194304))'
+            $result = Invoke-ProfileCleanupCommand -Command $script:ProbeExecutable -Arguments $arguments
+
+            $result.Success | Should -BeTrue
+            $result.StdOut | Should -Be (('o' * 8000) + "`n[...output truncated...]")
+            # A restricted child host may prepend provider initialization diagnostics to stderr.
+            $result.StdErr.Length | Should -BeLessOrEqual 8025
+            $result.StdErr | Should -Match ('e' * 4096)
+            $result.StdErr.EndsWith("`n[...stderr truncated...]") | Should -BeTrue
+        }
+
+        It 'preserves short output and a nonzero exit code' {
+            $arguments = ConvertTo-ProfileProbeArguments '[Console]::Out.Write(''short output''); [Console]::Error.Write(''short error''); exit 3'
+            $result = Invoke-ProfileCleanupCommand -Command $script:ProbeExecutable -Arguments $arguments
+
+            $result.Success | Should -BeFalse
+            $result.ExitCode | Should -Be 3
+            $result.StdOut | Should -Be 'short output'
+            $result.StdErr | Should -Match 'short error$'
+        }
+
+        It 'reports a start failure' {
+            $result = Invoke-ProfileCleanupCommand -Command (Join-Path $TestDrive 'missing-command.exe')
+
+            $result.Success | Should -BeFalse
+            $result.ExitCode | Should -Be -1
+            $result.StdOut | Should -BeNullOrEmpty
+            $result.StdErr | Should -BeNullOrEmpty
+        }
+
+        It 'allows a finite child to finish without a command timeout' {
+            $arguments = ConvertTo-ProfileProbeArguments '[Threading.Thread]::Sleep(2200); [Console]::Out.Write(''completed'')'
+            $result = Invoke-ProfileCleanupCommand -Command $script:ProbeExecutable -Arguments $arguments
+
+            $result.Success | Should -BeTrue
+            $result.ExitCode | Should -Be 0
+            $result.StdOut | Should -Be 'completed'
+        }
+
+        It 'cancels a running child promptly and closes its async wait handle' {
+            $marker = Join-Path $TestDrive 'cancel-child.pid'
+            $code = '[IO.File]::WriteAllText(''{0}'', $PID.ToString()); [Threading.Thread]::Sleep(10000)' -f $marker.Replace("'", "''")
+            $state = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+            $state.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Invoke-ProfileCleanupCommand', (Get-Command Invoke-ProfileCleanupCommand).Definition))
+            $state.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Write-ToolkitLog', 'param($Level, $Message, $Context)'))
+            $state.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Get-SourceTextLoc', 'param($Key, $Args) $Key'))
+            $worker = [PowerShell]::Create($state)
+            $handle = $null
+            $waitHandle = $null
+            try {
+                [void]$worker.AddScript('param($Executable, $Arguments) Invoke-ProfileCleanupCommand -Command $Executable -Arguments $Arguments', $true).
+                    AddArgument($script:ProbeExecutable).AddArgument((ConvertTo-ProfileProbeArguments $code))
+                $handle = $worker.BeginInvoke()
+                $waitHandle = $handle.AsyncWaitHandle
+                $startup = [Diagnostics.Stopwatch]::StartNew()
+                while (-not [IO.File]::Exists($marker) -and $startup.Elapsed.TotalSeconds -lt 8) { [Threading.Thread]::Sleep(20) }
+                [IO.File]::Exists($marker) | Should -BeTrue
+                $timer = [Diagnostics.Stopwatch]::StartNew()
+                Close-ProfileRemovalPowerShell -PowerShell $worker -Handle $handle -WaitHandle $waitHandle
+                $timer.Stop()
+
+                $timer.Elapsed.TotalSeconds | Should -BeLessThan 4
+                $waitHandle.SafeWaitHandle.IsClosed | Should -BeTrue
+                Get-Process -Id ([int][IO.File]::ReadAllText($marker)) -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+            }
+            finally { Close-ProfileRemovalPowerShell -PowerShell $worker -Handle $handle -WaitHandle $waitHandle }
+        }
+    }
+
     Context 'Folder removal failures with mocked Windows operations' {
         BeforeEach {
             $script:ProbeFolderPath = Join-Path $TestDrive 'Issue189[Probe]'
@@ -274,7 +355,7 @@ Describe 'Issue #189 safe regressions' {
             $script:RemovalAttempts = 0
             Mock Remove-CimInstance { throw 'Synthetic CIM removal failure' }
             Mock Remove-ProfileRegistryEntries { $true }
-            Mock Invoke-ExternalCommandWithLog { [pscustomobject]@{ Success = $true; ExitCode = 0 } }
+            Mock Invoke-ProfileCleanupCommand { [pscustomobject]@{ Success = $true; ExitCode = 0 } }
             Mock Remove-ItemSafely { $false }
             Mock Remove-Item { throw 'Unconfigured deletion probe' }
             Mock Test-Path { $true } -ParameterFilter { $Path -eq (Join-Path $env:TEMP 'EmptyFolder') }
@@ -299,11 +380,11 @@ Describe 'Issue #189 safe regressions' {
             Should -Invoke Remove-Item -Times 2 -Exactly -ParameterFilter {
                 $LiteralPath -eq $script:ProbeFolderPath -and $Recurse -and $Force -and $ErrorAction -eq 'Stop'
             }
-            Should -Invoke Invoke-ExternalCommandWithLog -Times 1 -Exactly -ParameterFilter { $Command -eq 'takeown.exe' }
-            Should -Invoke Invoke-ExternalCommandWithLog -Times 1 -Exactly -ParameterFilter {
+            Should -Invoke Invoke-ProfileCleanupCommand -Times 1 -Exactly -ParameterFilter { $Command -eq 'takeown.exe' }
+            Should -Invoke Invoke-ProfileCleanupCommand -Times 1 -Exactly -ParameterFilter {
                 $Command -eq 'robocopy.exe' -and $Arguments -contains '/XJ'
             }
-            Should -Invoke Invoke-ExternalCommandWithLog -Times 1 -Exactly -ParameterFilter {
+            Should -Invoke Invoke-ProfileCleanupCommand -Times 1 -Exactly -ParameterFilter {
                 $Command -eq 'icacls.exe' -and $Arguments -contains '*S-1-5-32-544:F'
             }
             Should -Invoke Remove-ProfileRegistryEntries -Times 1 -Exactly -ParameterFilter { $Sid -eq $script:ProbeProfile.SID }
@@ -331,7 +412,7 @@ Describe 'Issue #189 safe regressions' {
             $result.Start | Should -BeOfType ([datetime])
             Should -Invoke Remove-CimInstance -Times 1 -Exactly
             Should -Invoke Remove-Item -Times 0 -Exactly
-            Should -Invoke Invoke-ExternalCommandWithLog -Times 0 -Exactly
+            Should -Invoke Invoke-ProfileCleanupCommand -Times 0 -Exactly
             Should -Invoke Remove-ProfileRegistryEntries -Times 0 -Exactly
         }
 
@@ -369,7 +450,7 @@ Describe 'Issue #189 safe regressions' {
 
             $result.Success | Should -BeFalse
             Should -Invoke Remove-Item -Times 0 -Exactly
-            Should -Invoke Invoke-ExternalCommandWithLog -Times 0 -Exactly
+            Should -Invoke Invoke-ProfileCleanupCommand -Times 0 -Exactly
             Should -Invoke Remove-ProfileRegistryEntries -Times 0 -Exactly
         }
 
@@ -420,7 +501,7 @@ Describe 'Issue #189 safe regressions' {
             Should -Invoke Remove-Item -Times 2 -Exactly -ParameterFilter {
                 $LiteralPath -eq $script:ProbeFolderPath -and $Recurse -and $Force -and $ErrorAction -eq 'Stop'
             }
-            Should -Invoke Invoke-ExternalCommandWithLog -Times 1 -Exactly -ParameterFilter {
+            Should -Invoke Invoke-ProfileCleanupCommand -Times 1 -Exactly -ParameterFilter {
                 $Command -eq 'icacls.exe' -and $Arguments -contains '*S-1-5-32-544:F'
             }
         }
@@ -462,6 +543,35 @@ Describe 'Issue #189 safe regressions' {
     }
 
     Context 'Profile subtree planning without deletion' {
+        BeforeAll {
+            if (-not ('ProfileCleanupEnumeratorProbe' -as [type])) {
+                Add-Type -TypeDefinition @'
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+public sealed class ProfileCleanupEnumeratorProbe : IEnumerator<string> {
+    private readonly string prefix;
+    private readonly int count;
+    private int index = -1;
+    public int Reads;
+    public bool Disposed;
+    public int FailAfter = -1;
+    public ProfileCleanupEnumeratorProbe(string prefix, int count) { this.prefix = prefix; this.count = count; }
+    public string Current { get { return prefix + index.ToString(); } }
+    object IEnumerator.Current { get { return Current; } }
+    public bool MoveNext() {
+        Reads++;
+        if (FailAfter >= 0 && index >= FailAfter) { throw new IOException("Synthetic partial enumeration failure"); }
+        index++;
+        return index < count;
+    }
+    public void Reset() { throw new NotSupportedException(); }
+    public void Dispose() { Disposed = true; }
+}
+'@
+            }
+        }
         BeforeEach {
             $script:PlanRoot = 'C:\Users\Plan[Profile]'
             $script:PlanTree = @{
@@ -477,8 +587,15 @@ Describe 'Issue #189 safe regressions' {
                 )
                 "$script:PlanRoot\Documents" = @()
             }
-            Mock Get-Item { [pscustomobject]@{ Attributes = [System.IO.FileAttributes]::Directory } }
-            Mock Get-ChildItem { foreach ($entry in $script:PlanTree[$LiteralPath]) { $entry } }
+            Mock Get-Item {
+                foreach ($entries in $script:PlanTree.Values) {
+                    foreach ($entry in $entries) { if ($entry.FullName -eq $LiteralPath) { return $entry } }
+                }
+                [pscustomobject]@{ Attributes = [System.IO.FileAttributes]::Directory }
+            }
+            Mock New-ProfileDirectoryEnumerator {
+                return , (@($script:PlanTree[$Path] | ForEach-Object { $_.FullName }).GetEnumerator())
+            }
         }
 
         It 'returns disjoint child paths and never traverses a reparse point or enumerates files' {
@@ -489,10 +606,8 @@ Describe 'Issue #189 safe regressions' {
             $paths[1] | Should -Be "$script:PlanRoot\AppData\Roaming"
             $paths[2] | Should -Be "$script:PlanRoot\Documents"
             $paths | Should -Not -Contain "$script:PlanRoot\AppData"
-            Should -Invoke Get-ChildItem -Times 3 -Exactly -ParameterFilter {
-                $Directory -and $Force -and $ErrorAction -eq 'Stop' -and $LiteralPath -notlike '*\Junction'
-            }
-            Should -Invoke Get-ChildItem -Times 0 -Exactly -ParameterFilter { $LiteralPath -like '*\Link' -or $LiteralPath -like '*\Junction' }
+            Should -Invoke New-ProfileDirectoryEnumerator -Times 3 -Exactly
+            Should -Invoke New-ProfileDirectoryEnumerator -Times 0 -Exactly -ParameterFilter { $Path -like '*\Link' -or $Path -like '*\Junction' }
         }
 
         It 'leaves a reparse profile root to the original final cleanup' {
@@ -500,11 +615,11 @@ Describe 'Issue #189 safe regressions' {
 
             @(Get-ProfileCleanupSubtrees -Path $script:PlanRoot).Count | Should -Be 0
 
-            Should -Invoke Get-ChildItem -Times 0 -Exactly
+            Should -Invoke New-ProfileDirectoryEnumerator -Times 0 -Exactly
         }
 
         It 'falls back to whole-profile cleanup when root enumeration fails' {
-            Mock Get-ChildItem { throw 'Synthetic root enumeration failure' }
+            Mock New-ProfileDirectoryEnumerator { throw 'Synthetic root enumeration failure' }
 
             @(Get-ProfileCleanupSubtrees -Path $script:PlanRoot).Count | Should -Be 0
 
@@ -512,7 +627,7 @@ Describe 'Issue #189 safe regressions' {
         }
 
         It 'uses the inaccessible child as one leaf without losing its siblings' {
-            Mock Get-ChildItem { throw 'Synthetic child enumeration failure' } -ParameterFilter { $LiteralPath -like '*\AppData' }
+            Mock New-ProfileDirectoryEnumerator { throw 'Synthetic child enumeration failure' } -ParameterFilter { $Path -like '*\AppData' }
 
             $paths = @(Get-ProfileCleanupSubtrees -Path $script:PlanRoot)
 
@@ -520,6 +635,45 @@ Describe 'Issue #189 safe regressions' {
             $paths | Should -Contain "$script:PlanRoot\AppData"
             $paths | Should -Contain "$script:PlanRoot\Documents"
             Get-Content -LiteralPath $Global:CurrentLogFile -Raw | Should -Match 'Synthetic child enumeration failure'
+        }
+
+        It 'reads only requested paths from a million-entry branch and disposes both enumerators' {
+            $script:RootIterator = [ProfileCleanupEnumeratorProbe]::new("$script:PlanRoot\Branch", 1)
+            $script:ChildIterator = [ProfileCleanupEnumeratorProbe]::new("$script:PlanRoot\Branch0\Child", 1000000)
+            Mock New-ProfileDirectoryEnumerator {
+                if ($Path -eq $script:PlanRoot) { return , $script:RootIterator }
+                return , $script:ChildIterator
+            }
+            $cursor = Get-ProfileCleanupSubtrees -Path $script:PlanRoot -AsEnumerator
+            try {
+                $script:RootIterator.Reads | Should -Be 0
+                $cursor.MoveNext() | Should -BeTrue
+                $cursor.Current | Should -Be "$script:PlanRoot\Branch0\Child0"
+                $cursor.MoveNext() | Should -BeTrue
+                $script:ChildIterator.Reads | Should -Be 2
+            }
+            finally { $cursor.Dispose() }
+            $script:RootIterator.Disposed | Should -BeTrue
+            $script:ChildIterator.Disposed | Should -BeTrue
+        }
+
+        It 'never yields an overlapping parent when child enumeration fails after a yielded leaf' {
+            $script:RootIterator = [ProfileCleanupEnumeratorProbe]::new("$script:PlanRoot\Branch", 1)
+            $script:ChildIterator = [ProfileCleanupEnumeratorProbe]::new("$script:PlanRoot\Branch0\Child", 3)
+            $script:ChildIterator.FailAfter = 0
+            Mock New-ProfileDirectoryEnumerator {
+                if ($Path -eq $script:PlanRoot) { return , $script:RootIterator }
+                return , $script:ChildIterator
+            }
+
+            $paths = @(Get-ProfileCleanupSubtrees -Path $script:PlanRoot)
+
+            $paths.Count | Should -Be 1
+            $paths[0] | Should -Be "$script:PlanRoot\Branch0\Child0"
+            $paths | Should -Not -Contain "$script:PlanRoot\Branch0"
+            $script:RootIterator.Disposed | Should -BeTrue
+            $script:ChildIterator.Disposed | Should -BeTrue
+            Get-Content -LiteralPath $Global:CurrentLogFile -Raw | Should -Match 'Synthetic partial enumeration failure'
         }
     }
 
@@ -560,7 +714,7 @@ $scriptBlock = {
             ).Insert($script:ProfileRemovalWorkerOffset, $syntheticWorker)
             $probeSource = $probeSource.Replace('$ps = [PowerShell]::Create()', '$ps = New-TrackedProfilePowerShell')
             $probeSource = $probeSource.Replace('$handle = $ps.BeginInvoke()', '$handle = Invoke-ProfileProbeBeginInvoke -PowerShell $ps')
-            if ($probeSource -match '\b(Remove-CimInstance|Remove-Item|Invoke-ExternalCommandWithLog)\b') {
+            if ($probeSource -match '\b(Remove-CimInstance|Remove-Item|Invoke-ProfileCleanupCommand)\b') {
                 throw 'A destructive command remained in the scheduling probe.'
             }
             . ([scriptblock]::Create($probeSource))
@@ -606,7 +760,15 @@ $scriptBlock = {
                 }
                 return $sessionState
             }
-            Mock Get-ProfileCleanupSubtrees { $script:BatchSubtrees[$Path] }
+            Mock Get-ProfileCleanupSubtrees {
+                $cursor = [pscustomobject]@{ Paths = @($script:BatchSubtrees[$Path]).GetEnumerator(); Current = $null }
+                $cursor | Add-Member -MemberType ScriptMethod -Name MoveNext -Value {
+                    if ($this.Paths.MoveNext()) { $this.Current = $this.Paths.Current; return $true }
+                    return $false
+                }
+                $cursor | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
+                return $cursor
+            }
             Mock Write-ProgressUpdate { $script:BatchProgress.Add($Percent) }
             Mock Clear-ProgressLine {}
             Mock Receive-ProfileRemovalResult {
@@ -691,7 +853,7 @@ if ([System.IO.Directory]::Exists($FixtureRoot)) { throw 'Registry cleanup prece
 $FixtureEvents.Enqueue("Registry:$Sid")
 $true
 '@
-                    'Invoke-ExternalCommandWithLog' = 'param($Command, $Arguments, $LogContextKey)'
+                    'Invoke-ProfileCleanupCommand' = 'param($Command, $Arguments, $LogContextKey)'
                     'Write-ToolkitLog' = 'param($Level, $Message)'
                     'Get-SourceTextLoc' = 'param($Key, $Args) $Key'
                     'Test-Path' = 'param($Path) $true'
@@ -881,6 +1043,41 @@ $true
             foreach ($powerShell in $script:BatchCreatedPowerShells) {
                 Assert-ProfileProbePowerShellDisposed -PowerShell $powerShell
             }
+        }
+
+        It 'exposes no native command timeout parameter' {
+            foreach ($command in @('Invoke-ProfileCleanupCommand', 'Remove-ResidualUserFolder')) {
+                (Get-Command $command).Parameters.ContainsKey('TimeoutSeconds') | Should -BeFalse
+            }
+            $sourcePath = if ($CompiledScriptPath) { $CompiledScriptPath } else { Join-Path $script:RepoRoot 'tools\WinDeleteUserProfiles.ps1' }
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($sourcePath, [ref]$null, [ref]$null)
+            $tool = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'WinDeleteUserProfiles' }, $true)
+            $tool.Body.ParamBlock.Parameters.Name.VariablePath.UserPath | Should -Not -Contain 'ExternalCommandTimeoutSeconds'
+        }
+
+        It 'disposes an unfinished subtree cursor when collection fails' {
+            $maxThreadsEffective = 2
+            $profile = [pscustomobject]@{ Name = 'Cursor'; LocalPath = 'C:\Users\Cursor'; SID = 'cursor'; DelayMilliseconds = 1; Remaining = $true }
+            $script:AbandonedCursor = [pscustomobject]@{ Index = -1; Current = $null; Disposed = $false }
+            $script:AbandonedCursor | Add-Member -MemberType ScriptMethod -Name MoveNext -Value {
+                $this.Index++
+                $this.Current = "C:\Users\Cursor\Child$($this.Index)"
+                return $this.Index -lt 1000000
+            }
+            $script:AbandonedCursor | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.Disposed = $true }
+            Mock Get-ProfileCleanupSubtrees { $script:AbandonedCursor }
+            Mock Receive-ProfileRemovalResult {
+                $result = & $script:ProfileBatchResultReceiver -Job $Job -ResultType $ResultType
+                $script:BatchCollectedCount++
+                if ($Job.Phase -eq 'Folder') { throw 'Synthetic cursor collection failure' }
+                return $result
+            }
+
+            { Invoke-ProfileRemovalBatch -Profiles @($profile) } | Should -Throw '*Synthetic cursor collection failure*'
+
+            $script:AbandonedCursor.Disposed | Should -BeTrue
+            $script:AbandonedCursor.Index | Should -BeLessThan 10
+            foreach ($powerShell in $script:BatchCreatedPowerShells) { Assert-ProfileProbePowerShellDisposed -PowerShell $powerShell }
         }
 
         It 'disposes an instance when startup fails before job registration' {
@@ -1088,7 +1285,7 @@ $scriptBlock = {
             ).Insert($script:ResidualRemovalWorkerOffset, $syntheticWorker)
             $probeSource = $probeSource.Replace('$ps = [PowerShell]::Create()', '$ps = New-TrackedResidualPowerShell')
             $probeSource = $probeSource.Replace('$handle = $ps.BeginInvoke()', '$handle = Invoke-ResidualProbeBeginInvoke -PowerShell $ps')
-            if ($probeSource -match '\b(Remove-CimInstance|Remove-Item|Invoke-ExternalCommandWithLog|Remove-ResidualUserFolder)\b') {
+            if ($probeSource -match '\b(Remove-CimInstance|Remove-Item|Invoke-ProfileCleanupCommand|Remove-ResidualUserFolder)\b') {
                 throw 'A destructive command remained in the residual scheduling probe.'
             }
             . ([scriptblock]::Create($probeSource))
