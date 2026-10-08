@@ -144,7 +144,8 @@ function WinDeleteUserProfiles {
         catch {
             Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.cimProfileDetectionFailed0' -Args @($($_.Exception.Message)))
             
-            return , $pathSet
+            # Unknown registration must not turn registered folders into residual deletion candidates.
+            throw
         }
 
         $cimProfiles |
@@ -158,10 +159,50 @@ function WinDeleteUserProfiles {
             }
             catch {
                 Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.failedToNormalizeRegisteredProfileLocalpath0' -Args @($($_.LocalPath)))
+                throw
             }
         }
 
         return , $pathSet
+    }
+
+    # Only a path-not-found error proves absence; access and I/O failures must preserve profile registration.
+    function Test-ProfileCleanupDirectory {
+        param([Parameter(Mandatory = $true)][string]$Path)
+
+        try {
+            $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        }
+        catch [System.Management.Automation.ItemNotFoundException] {
+            return $false
+        }
+
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw [System.IO.IOException]::new("Profile cleanup cannot follow a reparse point: '$Path'.")
+        }
+        if (-not $item.PSIsContainer) {
+            throw [System.IO.IOException]::new("Profile cleanup target is not a directory: '$Path'.")
+        }
+        return $true
+    }
+
+    # CIM refusal can mean that a session loaded the profile after discovery; verify before filesystem fallback.
+    function Assert-ProfileCleanupProfileState {
+        param([Parameter(Mandatory = $true)][object]$Profile)
+
+        $sid = $Profile.SID
+        if ($sid -notmatch '^S-\d+(?:-\d+)+$') {
+            throw [System.InvalidOperationException]::new('Profile cleanup requires a valid profile SID.')
+        }
+        $current = @(Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$sid'" -ErrorAction Stop)
+        if ($current.Count -ne 1 -or $current[0].Loaded -ne $false -or $current[0].Special -ne $false) {
+            throw [System.InvalidOperationException]::new("Profile '$sid' is loaded, special, or cannot be safely verified.")
+        }
+        if ([string]::IsNullOrWhiteSpace($current[0].LocalPath) -or
+            -not [string]::Equals([System.IO.Path]::GetFullPath($current[0].LocalPath).TrimEnd('\'),
+                [System.IO.Path]::GetFullPath($Profile.LocalPath).TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw [System.InvalidOperationException]::new("Profile '$sid' no longer maps to the selected cleanup path.")
+        }
     }
 
     # Select unloaded, non-special profiles under the configured root before scheduling destructive work.
@@ -329,6 +370,8 @@ function WinDeleteUserProfiles {
                 'Get-SourceTextLoc',
                 'Write-ToolkitLog',
                 'Invoke-ProfileCleanupCommand',
+                'Test-ProfileCleanupDirectory',
+                'Assert-ProfileCleanupProfileState',
                 'Remove-ItemSafely',
                 'Remove-ProfileRegistryEntries',
                 'Remove-ResidualUserFolder',
@@ -583,7 +626,9 @@ function WinDeleteUserProfiles {
                 $ProfileItem,
                 [ValidateSet('Complete', 'Prepare', 'Folder', 'Finalize')]
                 [string]$Phase = 'Complete',
-                [datetime]$StartTime = [datetime]::MinValue
+                [datetime]$StartTime = [datetime]::MinValue,
+                $ParentProfile = $null,
+                [bool]$CheckProfileState = $true
             )
 
             # Terminating errors route failed deletion steps through their fallback cleanup paths.
@@ -593,6 +638,11 @@ function WinDeleteUserProfiles {
             $userName = [System.IO.Path]::GetFileName($userPath)
             $userSid = $ProfileItem.SID
             $start = if ($StartTime -eq [datetime]::MinValue) { Get-Date } else { $StartTime }
+            $profileToCheck = if ($ParentProfile) { $ParentProfile } else { $ProfileItem }
+
+            # Guard roots as well as children before CIM, robocopy, deletion, or ACL recovery can touch a link.
+            [void](Test-ProfileCleanupDirectory -Path $userPath)
+            if ($ParentProfile) { [void](Test-ProfileCleanupDirectory -Path $ParentProfile.LocalPath) }
 
             if ($Phase -ne 'Finalize') {
                 Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.startResidualFolder01' -Args @($userName, $userPath))
@@ -600,30 +650,29 @@ function WinDeleteUserProfiles {
 
             # Let Windows remove the registered profile first; filesystem cleanup handles any leftovers.
             if ($Phase -in @('Complete', 'Prepare')) {
+                if ($ProfileItem.Loaded -eq $true -or $ProfileItem.Special -eq $true) {
+                    throw [System.InvalidOperationException]::new("Profile '$userSid' is loaded or special.")
+                }
+                $CheckProfileState = $false
                 try {
                     Remove-CimInstance -InputObject $ProfileItem -ErrorAction Stop -Confirm:$false
                     Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.cimProfileRemoved0' -Args @($userName))
                 }
                 catch {
                     Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.cimRemoveFailed01' -Args @($userName, $($_.Exception.Message)))
+                    $CheckProfileState = $true
                 }
             }
 
-            if ($Phase -eq 'Prepare' -and [System.IO.Directory]::Exists($userPath)) {
+            # Only failed CIM removal leaves a registered profile requiring fresh checks in subsequent workers.
+            if ($CheckProfileState) { Assert-ProfileCleanupProfileState -Profile $profileToCheck }
+            $directoryExists = Test-ProfileCleanupDirectory -Path $userPath
+            if ($Phase -eq 'Prepare' -and $directoryExists) {
                 # Return control to the coordinator before any child or parent filesystem deletion starts.
-                return [PSCustomObject]@{ Type = 'ProfilePreparation'; Start = $start }
+                return [PSCustomObject]@{ Type = 'ProfilePreparation'; Start = $start; CheckProfileState = $CheckProfileState }
             }
 
-            if ($Phase -eq 'Folder' -and [System.IO.Directory]::Exists($userPath) -and
-                ((Get-Item -LiteralPath $userPath -Force -ErrorAction Stop).Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
-                # A link created after partitioning must not become a subtree deletion target.
-                return [PSCustomObject]@{
-                    Type = 'ResidualFolder'; UserName = $userName; Path = $userPath
-                    Success = $false; Duration = [TimeSpan]::Zero
-                }
-            }
-
-            if ([System.IO.Directory]::Exists($userPath)) {
+            if ($directoryExists) {
                 try {
                     # An empty source lets /MIR remove leftover contents; /XJ excludes junctions.
                     $tempEmpty = Join-Path $env:TEMP "EmptyFolder"
@@ -633,11 +682,14 @@ function WinDeleteUserProfiles {
                         [void][System.IO.Directory]::CreateDirectory($tempEmpty)
                     }
 
+                    [void](Test-ProfileCleanupDirectory -Path $userPath)
                     Invoke-ProfileCleanupCommand -Command 'robocopy.exe' `
                         -Arguments @("`"$tempEmpty`"", "`"$userPath`"", '/MIR', '/XJ', '/R:1', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP') `
                         -LogContextKey "ProfileCleanup-Robocopy-$userName" | Out-Null
 
-                    Remove-Item -LiteralPath $userPath -Recurse -Force -ErrorAction Stop -Confirm:$false
+                    if (Test-ProfileCleanupDirectory -Path $userPath) {
+                        Remove-Item -LiteralPath $userPath -Recurse -Force -ErrorAction Stop -Confirm:$false
+                    }
 
                     Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.folderRemoved0' -Args @($userName))
                 }
@@ -646,10 +698,17 @@ function WinDeleteUserProfiles {
 
                     # Repair ownership and access if permissions prevented standard folder removal.
                     try {
-                        Invoke-ProfileCleanupCommand -Command 'takeown.exe' -Arguments @('/F', "`"$userPath`"", '/R', '/D', 'Y') -LogContextKey "ProfileCleanup-TakeOwn-$userName" | Out-Null
+                        if ($CheckProfileState) { Assert-ProfileCleanupProfileState -Profile $profileToCheck }
+                        if (Test-ProfileCleanupDirectory -Path $userPath) {
+                            Invoke-ProfileCleanupCommand -Command 'takeown.exe' -Arguments @('/F', "`"$userPath`"", '/R', '/D', 'Y', '/SKIPSL') -LogContextKey "ProfileCleanup-TakeOwn-$userName" | Out-Null
+                        }
                         # S-1-5-32-544 - Fixed SID across Windows languages; avoids depending on localized group names.
-                        Invoke-ProfileCleanupCommand -Command 'icacls.exe' -Arguments @("`"$userPath`"", '/grant', '*S-1-5-32-544:F', '/T', '/C') -LogContextKey "ProfileCleanup-Icacls-$userName" | Out-Null
-                        Remove-Item -LiteralPath $userPath -Recurse -Force -ErrorAction Stop -Confirm:$false
+                        if (Test-ProfileCleanupDirectory -Path $userPath) {
+                            Invoke-ProfileCleanupCommand -Command 'icacls.exe' -Arguments @("`"$userPath`"", '/grant', '*S-1-5-32-544:F', '/T', '/C', '/L') -LogContextKey "ProfileCleanup-Icacls-$userName" | Out-Null
+                        }
+                        if (Test-ProfileCleanupDirectory -Path $userPath) {
+                            Remove-Item -LiteralPath $userPath -Recurse -Force -ErrorAction Stop -Confirm:$false
+                        }
                         Write-ToolkitLog -Level 'SUCCESS' -Message (Get-SourceTextLoc 'toolText.folderRemovedAfterAclReset0' -Args @($userName))
                     }
                     catch {
@@ -658,7 +717,7 @@ function WinDeleteUserProfiles {
                 }
             }
 
-            $folderGone = -not [System.IO.Directory]::Exists($userPath)
+            $folderGone = -not (Test-ProfileCleanupDirectory -Path $userPath)
             if ($Phase -eq 'Folder') {
                 # Child results never touch profile registration or count as completed profiles.
                 return [PSCustomObject]@{
@@ -722,6 +781,7 @@ function WinDeleteUserProfiles {
                         if ($plan) { [void]$activePlans.Add($plan) }
                         $context = [PSCustomObject]@{
                             Profile = $job.Profile; Index = $job.Index; Start = $result.Start
+                            CheckProfileState = $result.CheckProfileState
                             Plan = $plan; PendingPaths = [System.Collections.Generic.Queue[string]]::new()
                             Remaining = 0; EnumerationComplete = $false
                         }
@@ -808,7 +868,9 @@ function WinDeleteUserProfiles {
                     [void]$ps.AddScript($scriptBlock, $true).
                     AddArgument($profileItem).
                     AddArgument($range.Phase).
-                    AddArgument($startTime)
+                    AddArgument($startTime).
+                    AddArgument($(if ($range.Context) { $range.Context.Profile } else { $null })).
+                    AddArgument($(if ($range.Context) { [bool]$range.Context.CheckProfileState } else { $true }))
 
                     $handle = $ps.BeginInvoke()
                     $pendingHandle = $handle
@@ -896,16 +958,27 @@ function WinDeleteUserProfiles {
             -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)
         })
 
-        # SID-named folders need a registry exclusion in addition to the CIM path exclusion.
+        # Registry paths protect ordinary username folders even when CIM omits a registered profile.
         $profileListKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
         $registeredSids = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         try {
             # Constant-time lookups avoid scanning the entire SID list for every folder.
-            Get-ChildItem -LiteralPath $profileListKey -ErrorAction SilentlyContinue |
-            ForEach-Object { [void]$registeredSids.Add($_.PSChildName) }
+            Get-ChildItem -LiteralPath $profileListKey -ErrorAction Stop |
+            ForEach-Object {
+                [void]$registeredSids.Add($_.PSChildName)
+                $registeredPath = (Get-ItemProperty -LiteralPath $_.PSPath -Name 'ProfileImagePath' -ErrorAction Stop).ProfileImagePath
+                if ([string]::IsNullOrWhiteSpace($registeredPath)) {
+                    throw [System.InvalidOperationException]::new("Profile registration '$($_.PSChildName)' has no profile path.")
+                }
+                $registeredPath = [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($registeredPath)).TrimEnd('\')
+                if ($registeredPath.StartsWith($usersRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    [void]$registeredProfilePaths.Add($registeredPath)
+                }
+            }
         }
         catch {
             Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.couldNotEnumerateRegistryProfileList0' -Args @($($_.Exception.Message)))
+            throw
         }
 
         # Divide index ranges without copying folders; the cheap checks stay in this runspace to avoid pool overhead.
@@ -973,20 +1046,28 @@ function WinDeleteUserProfiles {
 
         try {
             # Literal paths preserve folder names containing wildcard characters during deletion.
-            Remove-Item -LiteralPath $folderPath -Force -Recurse -ErrorAction Stop -Confirm:$false
+            if (Test-ProfileCleanupDirectory -Path $folderPath) {
+                Remove-Item -LiteralPath $folderPath -Force -Recurse -ErrorAction Stop -Confirm:$false
+            }
             # A completed command is insufficient; verify that the directory is actually gone.
-            $success = -not [System.IO.Directory]::Exists($folderPath)
+            $success = -not (Test-ProfileCleanupDirectory -Path $folderPath)
         }
         catch {
             Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.standardResidualFolderRemovalFailed01' -Args @($folderPath, $($_.Exception.Message)))
 
             # Retry with ownership and access repaired when normal filesystem deletion fails.
             try {
-                Invoke-ProfileCleanupCommand -Command 'takeown.exe' -Arguments @('/F', "`"$folderPath`"", '/R', '/D', 'Y') -LogContextKey "ResidualTakeOwn-$($folder.Name)" | Out-Null
+                if (Test-ProfileCleanupDirectory -Path $folderPath) {
+                    Invoke-ProfileCleanupCommand -Command 'takeown.exe' -Arguments @('/F', "`"$folderPath`"", '/R', '/D', 'Y', '/SKIPSL') -LogContextKey "ResidualTakeOwn-$($folder.Name)" | Out-Null
+                }
                 # S-1-5-32-544 - Fixed SID across Windows languages; avoids depending on localized group names.
-                Invoke-ProfileCleanupCommand -Command 'icacls.exe' -Arguments @("`"$folderPath`"", '/grant', '*S-1-5-32-544:F', '/T', '/C') -LogContextKey "ResidualIcacls-$($folder.Name)" | Out-Null
-                Remove-Item -LiteralPath $folderPath -Recurse -Force -ErrorAction Stop -Confirm:$false
-                $success = -not [System.IO.Directory]::Exists($folderPath)
+                if (Test-ProfileCleanupDirectory -Path $folderPath) {
+                    Invoke-ProfileCleanupCommand -Command 'icacls.exe' -Arguments @("`"$folderPath`"", '/grant', '*S-1-5-32-544:F', '/T', '/C', '/L') -LogContextKey "ResidualIcacls-$($folder.Name)" | Out-Null
+                }
+                if (Test-ProfileCleanupDirectory -Path $folderPath) {
+                    Remove-Item -LiteralPath $folderPath -Recurse -Force -ErrorAction Stop -Confirm:$false
+                }
+                $success = -not (Test-ProfileCleanupDirectory -Path $folderPath)
             }
             catch {
                 Write-ToolkitLog -Level 'ERROR' -Message (Get-SourceTextLoc 'toolText.remnantFolderRemovalFailed01' -Args @($folderPath, $($_.Exception.Message)))

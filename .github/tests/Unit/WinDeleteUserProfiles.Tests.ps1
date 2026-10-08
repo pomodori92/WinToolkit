@@ -24,6 +24,8 @@ Describe 'Issue #189 safe regressions' {
             @{ Path = $toolPath; Name = 'Get-ProfileCleanupSubtrees' },
             @{ Path = $toolPath; Name = 'New-ProtectedNameSet' },
             @{ Path = $toolPath; Name = 'Get-RegisteredProfilePathSet' },
+            @{ Path = $toolPath; Name = 'Test-ProfileCleanupDirectory' },
+            @{ Path = $toolPath; Name = 'Assert-ProfileCleanupProfileState' },
             @{ Path = $toolPath; Name = 'Get-ResidualUserFolders' },
             @{ Path = $toolPath; Name = 'Remove-ProfileRegistryEntries' },
             @{ Path = $toolPath; Name = 'Remove-ResidualUserFolder' },
@@ -71,6 +73,7 @@ Describe 'Issue #189 safe regressions' {
         $script:ProfileRemovalWorkerLength = $workerAssignment.Extent.EndOffset - $workerAssignment.Extent.StartOffset
         $script:ProfileBatchResultReceiver = (Get-Command Receive-ProfileRemovalResult).ScriptBlock
         $script:ResidualSessionStateFactory = (Get-Command New-ProfileRemovalSessionState).ScriptBlock
+        $script:RegisteredProfilePathSetReader = (Get-Command Get-RegisteredProfilePathSet).ScriptBlock
         $residualBatchFunction = $toolAst.Find({
             param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Remove-ResidualUserFolders'
@@ -157,6 +160,7 @@ Describe 'Issue #189 safe regressions' {
                     ToolName = $Global:CurrentToolName
                     Helpers = @(
                         'Get-SourceTextLoc', 'Write-ToolkitLog', 'Invoke-ProfileCleanupCommand',
+                        'Test-ProfileCleanupDirectory', 'Assert-ProfileCleanupProfileState',
                         'Remove-ItemSafely', 'Remove-ProfileRegistryEntries', 'Remove-ResidualUserFolder', 'Get-SpinnerChar',
                         'Clear-ProgressLine', 'Write-ProgressUpdate'
                     ) | ForEach-Object { (Get-Command -Name $_ -CommandType Function -ErrorAction Stop).Name }
@@ -168,7 +172,7 @@ Describe 'Issue #189 safe regressions' {
                 $result.Message | Should -Be 'Profili registrati rimossi: 0'
                 $result.LogPath | Should -Be $Global:CurrentLogFile
                 $result.ToolName | Should -Be 'Issue189Probe'
-                $result.Helpers.Count | Should -Be 9
+                $result.Helpers.Count | Should -Be 11
             }
             $logLines = @(Get-Content -LiteralPath $Global:CurrentLogFile | Where-Object { $_ -match '\[INFO\]' })
             $logLines.Count | Should -Be 4
@@ -337,6 +341,37 @@ Describe 'Issue #189 safe regressions' {
         }
     }
 
+    Context 'Directory absence proof without profile deletion' {
+        It 'recognizes a directory with literal wildcard characters' {
+            $path = Join-Path $TestDrive 'Inspection[Literal]'
+            [void][System.IO.Directory]::CreateDirectory($path)
+
+            Test-ProfileCleanupDirectory -Path $path | Should -BeTrue
+        }
+
+        It 'recognizes a confirmed missing directory' {
+            Test-ProfileCleanupDirectory -Path (Join-Path $TestDrive 'Missing[Literal]') | Should -BeFalse
+        }
+
+        It 'does not turn <Failure> into confirmed absence' -ForEach @(
+            @{ Failure = 'Access' }, @{ Failure = 'IO' }
+        ) {
+            Mock Get-Item {
+                if ($Failure -eq 'Access') { throw [System.UnauthorizedAccessException]::new('Synthetic access failure') }
+                throw [System.IO.IOException]::new('Synthetic I/O failure')
+            }
+
+            { Test-ProfileCleanupDirectory -Path 'C:\ReviewMock\Unknown' } | Should -Throw
+        }
+
+        It 'does not mistake an existing file for a deleted directory' {
+            $path = Join-Path $TestDrive 'UnexpectedFile.txt'
+            Set-Content -LiteralPath $path -Value 'Owned test fixture'
+
+            { Test-ProfileCleanupDirectory -Path $path } | Should -Throw '*not a directory*'
+        }
+    }
+
     Context 'Folder removal failures with mocked Windows operations' {
         BeforeEach {
             $script:ProbeFolderPath = Join-Path $TestDrive 'Issue189[Probe]'
@@ -353,6 +388,13 @@ Describe 'Issue #189 safe regressions' {
                 )
             }
             $script:RemovalAttempts = 0
+            $script:FreshProfileLoaded = $false
+            Mock Get-CimInstance {
+                [pscustomobject]@{
+                    SID = $script:ProbeProfile.SID; LocalPath = $script:ProbeFolderPath
+                    Loaded = $script:FreshProfileLoaded; Special = $false
+                }
+            }
             Mock Remove-CimInstance { throw 'Synthetic CIM removal failure' }
             Mock Remove-ProfileRegistryEntries { $true }
             Mock Invoke-ProfileCleanupCommand { [pscustomobject]@{ Success = $true; ExitCode = 0 } }
@@ -385,7 +427,10 @@ Describe 'Issue #189 safe regressions' {
                 $Command -eq 'robocopy.exe' -and $Arguments -contains '/XJ'
             }
             Should -Invoke Invoke-ProfileCleanupCommand -Times 1 -Exactly -ParameterFilter {
-                $Command -eq 'icacls.exe' -and $Arguments -contains '*S-1-5-32-544:F'
+                $Command -eq 'icacls.exe' -and $Arguments -contains '*S-1-5-32-544:F' -and $Arguments -contains '/L'
+            }
+            Should -Invoke Invoke-ProfileCleanupCommand -Times 1 -Exactly -ParameterFilter {
+                $Command -eq 'takeown.exe' -and $Arguments -contains '/SKIPSL'
             }
             Should -Invoke Remove-ProfileRegistryEntries -Times 1 -Exactly -ParameterFilter { $Sid -eq $script:ProbeProfile.SID }
             Should -Invoke Remove-ItemSafely -Times 0 -Exactly
@@ -446,12 +491,128 @@ Describe 'Issue #189 safe regressions' {
         It 'skips a child that has become a reparse point after partitioning' {
             Mock Get-Item { [pscustomobject]@{ Attributes = [System.IO.FileAttributes]::ReparsePoint } }
 
-            $result = & $script:ProfileRemovalWorker $script:ProbeProfile 'Folder'
-
-            $result.Success | Should -BeFalse
+            { & $script:ProfileRemovalWorker $script:ProbeProfile 'Folder' } | Should -Throw '*reparse point*'
             Should -Invoke Remove-Item -Times 0 -Exactly
             Should -Invoke Invoke-ProfileCleanupCommand -Times 0 -Exactly
             Should -Invoke Remove-ProfileRegistryEntries -Times 0 -Exactly
+        }
+
+        It 'rejects a reparse root before any cleanup in <Phase>' -ForEach @(
+            @{ Phase = 'Prepare' }, @{ Phase = 'Complete' }, @{ Phase = 'Finalize' }
+        ) {
+            Mock Get-Item { [pscustomobject]@{ Attributes = [System.IO.FileAttributes]::ReparsePoint } }
+
+            { & $script:ProfileRemovalWorker $script:ProbeProfile $Phase } | Should -Throw '*reparse point*'
+
+            Should -Invoke Remove-CimInstance -Times 0 -Exactly
+            Should -Invoke Remove-Item -Times 0 -Exactly
+            Should -Invoke Invoke-ProfileCleanupCommand -Times 0 -Exactly
+            Should -Invoke Remove-ProfileRegistryEntries -Times 0 -Exactly
+        }
+
+        It 'does not bypass a failed CIM removal when fresh state is <State>' -ForEach @(
+            @{ State = 'Loaded' }, @{ State = 'Special' }, @{ State = 'Missing' }, @{ State = 'Unknown' }, @{ State = 'ChangedPath' }
+        ) {
+            Mock Get-CimInstance {
+                switch ($State) {
+                    'Unknown' { throw 'Synthetic profile-state detection failure' }
+                    'Missing' { return }
+                    default {
+                        [pscustomobject]@{
+                            SID = $script:ProbeProfile.SID
+                            LocalPath = $(if ($State -eq 'ChangedPath') { $script:ProbeFolderPath + '-Changed' } else { $script:ProbeFolderPath })
+                            Loaded = $State -eq 'Loaded'; Special = $State -eq 'Special'
+                        }
+                    }
+                }
+            }
+
+            { & $script:ProfileRemovalWorker $script:ProbeProfile 'Prepare' } | Should -Throw
+
+            Should -Invoke Remove-CimInstance -Times 1 -Exactly
+            Should -Invoke Get-CimInstance -Times 1 -Exactly -ParameterFilter {
+                $ClassName -eq 'Win32_UserProfile' -and $Filter -eq "SID='$($script:ProbeProfile.SID)'" -and $ErrorAction -eq 'Stop'
+            }
+            Should -Invoke Remove-Item -Times 0 -Exactly
+            Should -Invoke Invoke-ProfileCleanupCommand -Times 0 -Exactly
+            Should -Invoke Remove-ProfileRegistryEntries -Times 0 -Exactly
+        }
+
+        It 'rechecks the parent profile in <Phase> after it becomes loaded' -ForEach @(
+            @{ Phase = 'Folder' }, @{ Phase = 'Finalize' }
+        ) {
+            $preparation = & $script:ProfileRemovalWorker $script:ProbeProfile 'Prepare'
+            $preparation.CheckProfileState | Should -BeTrue
+            $script:FreshProfileLoaded = $true
+
+            { & $script:ProfileRemovalWorker $script:ProbeProfile $Phase $preparation.Start $script:ProbeProfile $preparation.CheckProfileState } | Should -Throw '*safely verified*'
+
+            Should -Invoke Remove-Item -Times 0 -Exactly
+            Should -Invoke Invoke-ProfileCleanupCommand -Times 0 -Exactly
+            Should -Invoke Remove-ProfileRegistryEntries -Times 0 -Exactly
+        }
+
+        It 'does not requery removed registration after successful CIM cleanup leaves a folder' {
+            Mock Remove-CimInstance {}
+
+            $preparation = & $script:ProfileRemovalWorker $script:ProbeProfile 'Prepare'
+
+            $preparation.CheckProfileState | Should -BeFalse
+            Should -Invoke Get-CimInstance -Times 0 -Exactly
+        }
+
+        It 'stops deletion and ACL recovery when robocopy is followed by a replaced link' {
+            $script:TargetBecameLink = $false
+            Mock Get-Item {
+                [pscustomobject]@{
+                    PSIsContainer = $true
+                    Attributes = $(if ($script:TargetBecameLink) { [System.IO.FileAttributes]::ReparsePoint } else { [System.IO.FileAttributes]::Directory })
+                }
+            }
+            Mock Invoke-ProfileCleanupCommand { $script:TargetBecameLink = $true }
+
+            { & $script:ProfileRemovalWorker $script:ProbeProfile 'Finalize' } | Should -Throw '*reparse point*'
+
+            Should -Invoke Invoke-ProfileCleanupCommand -Times 1 -Exactly -ParameterFilter { $Command -eq 'robocopy.exe' }
+            Should -Invoke Invoke-ProfileCleanupCommand -Times 0 -Exactly -ParameterFilter { $Command -in @('takeown.exe', 'icacls.exe') }
+            Should -Invoke Remove-Item -Times 0 -Exactly
+            Should -Invoke Remove-ProfileRegistryEntries -Times 0 -Exactly
+        }
+
+        It 'keeps registration when directory inspection fails before cleanup' {
+            Mock Get-Item { throw [System.UnauthorizedAccessException]::new('Synthetic directory denial') }
+
+            { & $script:ProfileRemovalWorker $script:ProbeProfile 'Finalize' } | Should -Throw '*Synthetic directory denial*'
+
+            Should -Invoke Remove-Item -Times 0 -Exactly
+            Should -Invoke Invoke-ProfileCleanupCommand -Times 0 -Exactly
+            Should -Invoke Remove-ProfileRegistryEntries -Times 0 -Exactly
+        }
+
+        It 'keeps registration when post-deletion inspection fails' {
+            $script:InspectionFailed = $false
+            Mock Get-Item {
+                if ($script:InspectionFailed) { throw [System.IO.IOException]::new('Synthetic verification I/O failure') }
+                [pscustomobject]@{ PSIsContainer = $true; Attributes = [System.IO.FileAttributes]::Directory }
+            }
+            # The mocked command changes inspection state and never deletes the fixture.
+            Mock Remove-Item { $script:InspectionFailed = $true }
+
+            { & $script:ProfileRemovalWorker $script:ProbeProfile 'Finalize' } | Should -Throw '*Synthetic verification I/O failure*'
+
+            Should -Invoke Remove-Item -Times 1 -Exactly
+            Should -Invoke Remove-ProfileRegistryEntries -Times 0 -Exactly
+            [System.IO.Directory]::Exists($script:ProbeFolderPath) | Should -BeTrue
+        }
+
+        It 'rejects a residual candidate replaced by a link before its worker starts' {
+            Mock Get-Item { [pscustomobject]@{ Attributes = [System.IO.FileAttributes]::ReparsePoint } }
+            $folder = [pscustomobject]@{ Name = 'ReplacedLink'; Path = $script:ProbeFolderPath }
+
+            (Remove-ResidualUserFolder -Folder $folder).Success | Should -BeFalse
+
+            Should -Invoke Remove-Item -Times 0 -Exactly
+            Should -Invoke Invoke-ProfileCleanupCommand -Times 0 -Exactly
         }
 
         It 'finalizes the root with the original start time and without repeating CIM removal' {
@@ -825,7 +986,7 @@ $scriptBlock = {
             $root = Join-Path $TestDrive 'Phased[Profile]'
             $children = @((Join-Path $root 'Left'), (Join-Path $root 'Right'))
             foreach ($path in $children) { [void][System.IO.Directory]::CreateDirectory($path) }
-            $profile = [pscustomobject]@{ LocalPath = $root; SID = 'fixture-sid' }
+            $profile = [pscustomobject]@{ LocalPath = $root; SID = 'S-1-5-21-189-777' }
             $script:BatchSubtrees[$root] = $children
             $targets = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
             foreach ($path in @($root) + $children) { [void]$targets.Add($path) }
@@ -835,6 +996,12 @@ $scriptBlock = {
                 $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('FixtureRoot', $root, ''))
                 $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('FixtureEvents', $script:BatchEvents, ''))
                 $stubs = @{
+                    'Test-ProfileCleanupDirectory' = (Get-Command Test-ProfileCleanupDirectory).Definition
+                    'Assert-ProfileCleanupProfileState' = (Get-Command Assert-ProfileCleanupProfileState).Definition
+                    'Get-CimInstance' = @'
+[CmdletBinding()] param($ClassName, $Filter)
+[pscustomobject]@{ SID = 'S-1-5-21-189-777'; LocalPath = $FixtureRoot; Loaded = $false; Special = $false }
+'@
                     'Remove-CimInstance' = @'
 [CmdletBinding()] param($InputObject, [switch]$Confirm)
 $FixtureEvents.Enqueue("CIM:$($InputObject.LocalPath)")
@@ -857,7 +1024,14 @@ $true
                     'Write-ToolkitLog' = 'param($Level, $Message)'
                     'Get-SourceTextLoc' = 'param($Key, $Args) $Key'
                     'Test-Path' = 'param($Path) $true'
-                    'Get-Item' = '[CmdletBinding()] param($LiteralPath, [switch]$Force) [pscustomobject]@{ Attributes = [System.IO.FileAttributes]::Directory }'
+                    'Get-Item' = @'
+[CmdletBinding()] param($LiteralPath, [switch]$Force)
+if (-not $FixtureTargets.Contains($LiteralPath)) { throw 'Unexpected fixture inspection target' }
+if (-not [System.IO.Directory]::Exists($LiteralPath)) {
+    throw [System.Management.Automation.ItemNotFoundException]::new('Owned fixture directory is gone')
+}
+[pscustomobject]@{ PSIsContainer = $true; Attributes = [System.IO.FileAttributes]::Directory }
+'@
                 }
                 foreach ($name in $stubs.Keys) {
                     $sessionState.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($name, $stubs[$name]))
@@ -870,13 +1044,13 @@ $true
             $results.Count | Should -Be 1
             $results[0].Success | Should -BeTrue
             $results[0].Path | Should -Be $root
-            $results[0].Sid | Should -Be 'fixture-sid'
+            $results[0].Sid | Should -Be 'S-1-5-21-189-777'
             [System.IO.Directory]::Exists($root) | Should -BeFalse
             $events = $script:BatchEvents.ToArray()
             @($events | Where-Object { $_ -like 'CIM:*' }).Count | Should -Be 1
             @($events | Where-Object { $_ -like 'Removed:*' }).Count | Should -Be 3
             $events[-2] | Should -Be "Removed:$root"
-            $events[-1] | Should -Be 'Registry:fixture-sid'
+            $events[-1] | Should -Be 'Registry:S-1-5-21-189-777'
         }
 
         It 'uses a global cap of <Threads> across odd child counts and combines profiles in input order' -ForEach @(
@@ -1200,13 +1374,55 @@ $true
             Mock Get-ChildItem {
                 if ($LiteralPath -eq $script:ScanRoot) { foreach ($folder in $script:ScanFolders) { $folder } }
                 elseif ($LiteralPath -eq 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList') {
-                    foreach ($sid in $script:ScanSids) { [pscustomobject]@{ PSChildName = $sid } }
+                    foreach ($sid in $script:ScanSids) { [pscustomobject]@{ PSChildName = $sid; PSPath = "HKLM:\ProfileReviewMock\$sid" } }
                 }
                 else { throw 'Unexpected discovery target' }
             }
             Mock Write-StyledMessage {}
             Mock Write-ToolkitLog {}
+            Mock Get-ItemProperty { [pscustomobject]@{ ProfileImagePath = 'C:\OutsideScanRoot\Profile' } }
             Mock New-ProfileRemovalSessionState { throw 'Discovery must not allocate a worker pool' }
+        }
+
+        It 'stops residual discovery when CIM detection fails' {
+            Mock Get-RegisteredProfilePathSet { & $script:RegisteredProfilePathSetReader }
+            Mock Get-CimInstance { throw 'Synthetic CIM detection failure' }
+
+            { Get-ResidualUserFolders } | Should -Throw '*Synthetic CIM detection failure*'
+
+            Should -Invoke Get-ChildItem -Times 0 -Exactly
+        }
+
+        It 'protects ordinary username folders mapped only by registry ProfileImagePath' {
+            $script:ScanFolders = @([pscustomobject]@{
+                Name = 'Alice'; FullName = $script:ScanRoot + 'Alice'; Attributes = [System.IO.FileAttributes]::Directory
+            })
+            $script:ScanSids = @('S-1-5-21-189-1001')
+            Mock Get-ItemProperty { [pscustomobject]@{ ProfileImagePath = $script:ScanRoot.ToUpperInvariant() + 'ALICE\' } }
+
+            @(Get-ResidualUserFolders).Count | Should -Be 0
+
+            Should -Invoke Get-ItemProperty -Times 1 -Exactly -ParameterFilter { $Name -eq 'ProfileImagePath' -and $ErrorAction -eq 'Stop' }
+        }
+
+        It 'stops discovery on <Failure> instead of accepting incomplete registry protection' -ForEach @(
+            @{ Failure = 'Enumeration' }, @{ Failure = 'PathRead' }, @{ Failure = 'EmptyPath' }
+        ) {
+            $script:ScanSids = @('S-1-5-21-189-1001')
+            $script:ScanFolders = @([pscustomobject]@{
+                Name = 'Alice'; FullName = $script:ScanRoot + 'Alice'; Attributes = [System.IO.FileAttributes]::Directory
+            })
+            if ($Failure -eq 'Enumeration') {
+                Mock Get-ChildItem { throw 'Synthetic registry enumeration failure' } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
+            }
+            elseif ($Failure -eq 'PathRead') {
+                Mock Get-ItemProperty { throw 'Synthetic registry path read failure' }
+            }
+            else { Mock Get-ItemProperty { [pscustomobject]@{ ProfileImagePath = '' } } }
+
+            { Get-ResidualUserFolders } | Should -Throw
+
+            Should -Invoke Get-ChildItem -Times 1 -Exactly -ParameterFilter { $LiteralPath -like 'HKLM:*' -and $ErrorAction -eq 'Stop' }
         }
 
         It 'covers every leaf of <Count> folders and preserves discovery order' -ForEach @(
