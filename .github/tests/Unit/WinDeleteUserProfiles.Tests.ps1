@@ -21,6 +21,9 @@ Describe 'Issue #189 safe regressions' {
             @{ Path = $toolPath; Name = 'Receive-ProfileRemovalResult' },
             @{ Path = $toolPath; Name = 'Close-ProfileRemovalPowerShell' },
             @{ Path = $toolPath; Name = 'Get-ProfileCleanupSubtrees' },
+            @{ Path = $toolPath; Name = 'New-ProtectedNameSet' },
+            @{ Path = $toolPath; Name = 'Get-RegisteredProfilePathSet' },
+            @{ Path = $toolPath; Name = 'Get-ResidualUserFolders' },
             @{ Path = $toolPath; Name = 'Remove-ProfileRegistryEntries' },
             @{ Path = $toolPath; Name = 'Remove-ResidualUserFolder' },
             @{ Path = $toolPath; Name = 'Remove-ResidualUserFolders' },
@@ -29,6 +32,7 @@ Describe 'Issue #189 safe regressions' {
             @{ Path = $processesPath; Name = 'Invoke-ExternalCommandWithLog' },
             @{ Path = $processesPath; Name = 'Remove-ItemSafely' },
             @{ Path = $uiPath; Name = 'Get-SpinnerChar' },
+            @{ Path = $uiPath; Name = 'Write-StyledMessage' },
             @{ Path = $uiPath; Name = 'Clear-ProgressLine' },
             @{ Path = $uiPath; Name = 'Write-ProgressUpdate' }
         )
@@ -207,6 +211,18 @@ Describe 'Issue #189 safe regressions' {
     }
 
     Context 'Profile result collection without deletion' {
+        It 'disposes a pipeline even when clearing its command references throws' {
+            $commands = [pscustomobject]@{}
+            $commands | Add-Member -MemberType ScriptMethod -Name Clear -Value { throw 'Synthetic clear failure' }
+            $powerShell = [pscustomobject]@{ Commands = $commands; Disposed = $false }
+            $powerShell | Add-Member -MemberType ScriptMethod -Name EndInvoke -Value { param($Handle) [pscustomobject]@{ Type = 'Profile'; Success = $true } }
+            $powerShell | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.Disposed = $true }
+            $job = [pscustomobject]@{ PowerShell = $powerShell; Handle = $null }
+
+            { Receive-ProfileRemovalResult -Job $job } | Should -Throw '*Synthetic clear failure*'
+
+            $powerShell.Disposed | Should -BeTrue
+        }
         It 'records a worker exception as one failed profile with its identity' {
             $powerShell = [PowerShell]::Create()
             [void]$powerShell.AddScript("throw 'Synthetic runspace failure'")
@@ -931,6 +947,116 @@ $true
             Assert-ProfileProbePowerShellDisposed -PowerShell $nextPowerShell
             Should -Invoke Write-Warning -Times 1 -Exactly -ParameterFilter {
                 $Message -like '*Synthetic dispose failure*' -and $WarningAction -eq 'Continue'
+            }
+        }
+    }
+
+    Context 'Registry cleanup leaves with mocked operations' {
+        BeforeEach {
+            Mock Test-Path { $true }
+            Mock Remove-Item {}
+            Mock Write-ToolkitLog {}
+        }
+
+        It 'removes only the selected SID key' {
+            Remove-ProfileRegistryEntries -Sid 'S-1-5-21-189-1' -UserName 'Probe' | Should -BeTrue
+
+            Should -Invoke Remove-Item -Times 1 -Exactly -ParameterFilter {
+                $LiteralPath -eq 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\S-1-5-21-189-1' -and $Recurse -and $Force -and $ErrorAction -eq 'Stop'
+            }
+        }
+
+        It 'treats an already absent key as successful' {
+            Mock Test-Path { $false }
+
+            Remove-ProfileRegistryEntries -Sid 'S-1-5-21-189-1' -UserName 'Probe' | Should -BeTrue
+
+            Should -Invoke Remove-Item -Times 0 -Exactly
+        }
+
+        It 'retains registry failures in the profile outcome' {
+            Mock Remove-Item { throw 'Synthetic registry denial' }
+
+            Remove-ProfileRegistryEntries -Sid 'S-1-5-21-189-1' -UserName 'Probe' | Should -BeFalse
+
+            Should -Invoke Write-ToolkitLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARNING' }
+        }
+
+        It 'rejects the placeholder SID without accessing the registry' {
+            Remove-ProfileRegistryEntries -Sid 'NULL' -UserName 'Probe' | Should -BeFalse
+
+            Should -Invoke Test-Path -Times 0 -Exactly
+            Should -Invoke Remove-Item -Times 0 -Exactly
+        }
+    }
+
+    Context 'Residual discovery range partitioning without deletion' {
+        BeforeEach {
+            $usersRoot = 'C:\Users\Scan[Root]\'
+            $script:ScanRoot = $usersRoot
+            $script:ScanFolders = @()
+            $script:ScanSids = @()
+            $script:ScanExcluded = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $script:ScanRegistered = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            Mock New-ProtectedNameSet { return , $script:ScanExcluded }
+            Mock Get-RegisteredProfilePathSet { return , $script:ScanRegistered }
+            Mock Get-ChildItem {
+                if ($LiteralPath -eq $script:ScanRoot) { foreach ($folder in $script:ScanFolders) { $folder } }
+                elseif ($LiteralPath -eq 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList') {
+                    foreach ($sid in $script:ScanSids) { [pscustomobject]@{ PSChildName = $sid } }
+                }
+                else { throw 'Unexpected discovery target' }
+            }
+            Mock Write-StyledMessage {}
+            Mock Write-ToolkitLog {}
+            Mock New-ProfileRemovalSessionState { throw 'Discovery must not allocate a worker pool' }
+        }
+
+        It 'covers every leaf of <Count> folders and preserves discovery order' -ForEach @(
+            @{ Count = 0 }, @{ Count = 1 }, @{ Count = 255 }, @{ Count = 256 },
+            @{ Count = 257 }, @{ Count = 513 }, @{ Count = 4097 }
+        ) {
+            $script:ScanFolders = @(for ($index = 0; $index -lt $Count; $index++) {
+                [pscustomobject]@{
+                    Name = "Candidate[$index]"; FullName = "$($script:ScanRoot)Candidate[$index]"
+                    Attributes = [System.IO.FileAttributes]::Directory
+                }
+            })
+
+            $results = @(Get-ResidualUserFolders)
+
+            $results.Count | Should -Be $Count
+            ($results.Name -join "`n") | Should -Be ($script:ScanFolders.Name -join "`n")
+            ($results.Path -join "`n") | Should -Be ($script:ScanFolders.FullName -join "`n")
+            Should -Invoke New-ProfileRemovalSessionState -Times 0 -Exactly
+            Should -Invoke Get-RegisteredProfilePathSet -Times 1 -Exactly
+            Should -Invoke Get-ChildItem -Times 2 -Exactly
+        }
+
+        It 'preserves protected names, CIM paths, SID names, and link exclusions across partitions' {
+            $script:ScanFolders = @(for ($index = 0; $index -lt 513; $index++) {
+                [pscustomobject]@{
+                    Name = "Candidate[$index]"; FullName = "$($script:ScanRoot)Candidate[$index]"
+                    Attributes = [System.IO.FileAttributes]::Directory
+                }
+            })
+            [void]$script:ScanExcluded.Add('CANDIDATE[0]')
+            [void]$script:ScanRegistered.Add($script:ScanFolders[256].FullName.ToUpperInvariant())
+            $script:ScanSids = @('CANDIDATE[257]', 'CANDIDATE[257]')
+            $script:ScanFolders[512].Attributes = [System.IO.FileAttributes]::ReparsePoint
+
+            $results = @(Get-ResidualUserFolders)
+
+            $results.Count | Should -Be 509
+            $results.Name | Should -Not -Contain 'Candidate[0]'
+            $results.Name | Should -Not -Contain 'Candidate[256]'
+            $results.Name | Should -Not -Contain 'Candidate[257]'
+            $results.Name | Should -Not -Contain 'Candidate[512]'
+            $results[0].Name | Should -Be 'Candidate[1]'
+            $results[-1].Name | Should -Be 'Candidate[511]'
+            Should -Invoke Write-ToolkitLog -Times 4 -Exactly -ParameterFilter { $Level -eq 'INFO' }
+            Should -Invoke Get-ChildItem -Times 1 -Exactly -ParameterFilter {
+                $LiteralPath -eq $script:ScanRoot -and $Directory -and $Force
             }
         }
     }

@@ -99,6 +99,7 @@ function WinDeleteUserProfiles {
     }
 
     # Remove leftover ProfileList state after the profile directory is gone, reporting registry failure separately.
+    # A single SID is a cleanup leaf; different profiles already reach it through the bounded removal pool.
     function Remove-ProfileRegistryEntries {
         param(
             [Parameter(Mandatory = $true)]
@@ -215,6 +216,7 @@ function WinDeleteUserProfiles {
     }
 
     # Supply worker dependencies explicitly: runspaces do not inherit toolkit functions or language/log context.
+    # Build this small, fixed dependency set once per pool; there is no bulk work to partition here.
     function New-ProfileRemovalSessionState {
         $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
 
@@ -299,12 +301,13 @@ function WinDeleteUserProfiles {
         }
         finally {
             # Release command references and pipeline resources as soon as collection finishes.
-            $Job.PowerShell.Commands.Clear()
-            $Job.PowerShell.Dispose()
+            try { $Job.PowerShell.Commands.Clear() }
+            finally { $Job.PowerShell.Dispose() }
         }
     }
 
     # Clean up workers abandoned by a batch failure while keeping individual cleanup errors non-terminating.
+    # Stop and Dispose form one ordered leaf operation and must finish before the owning pool closes.
     function Close-ProfileRemovalPowerShell {
         param(
             [Parameter(Mandatory = $true)]
@@ -653,7 +656,7 @@ function WinDeleteUserProfiles {
         }
     }
 
-    # Select leftover directories only after protected-name, CIM-path, registered-SID, and link exclusions.
+    # Select leftovers from balanced index ranges while preserving name, CIM-path, SID, and link exclusions.
     function Get-ResidualUserFolders {
         $excluded = New-ProtectedNameSet
         # Refresh registration after profile removal so this scan reflects the state Windows now reports.
@@ -663,49 +666,68 @@ function WinDeleteUserProfiles {
         Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.checkResidualFoldersInTheUsersDirectory')
 
         # Exclude reparse points so residual cleanup does not select links into other locations.
-        $folders = Get-ChildItem -Path $usersRoot -Directory -Force |
+        $folders = @(Get-ChildItem -LiteralPath $usersRoot -Directory -Force |
         Where-Object {
             -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)
-        }
+        })
 
         # SID-named folders need a registry exclusion in addition to the CIM path exclusion.
         $profileListKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
-        $registeredSids = @()
+        $registeredSids = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         try {
-            $registeredSids = Get-ChildItem -Path $profileListKey -ErrorAction SilentlyContinue | ForEach-Object { $_.PSChildName }
+            # Constant-time lookups avoid scanning the entire SID list for every folder.
+            Get-ChildItem -LiteralPath $profileListKey -ErrorAction SilentlyContinue |
+            ForEach-Object { [void]$registeredSids.Add($_.PSChildName) }
         }
         catch {
             Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.couldNotEnumerateRegistryProfileList0' -Args @($($_.Exception.Message)))
         }
 
-        foreach ($folder in $folders) {
-            $folderName = $folder.Name
-            $folderPath = [System.IO.Path]::GetFullPath($folder.FullName).TrimEnd('\')
-
-            if ($excluded.Contains($folderName)) {
-                Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.residualFolderExcludedForProtectedName01' -Args @($folderName, $folderPath))
+        # Divide index ranges without copying folders; the cheap checks stay in this runspace to avoid pool overhead.
+        $ranges = [System.Collections.Generic.Stack[object]]::new()
+        if ($folders.Count -gt 0) {
+            $ranges.Push([PSCustomObject]@{ Start = 0; Count = $folders.Count })
+        }
+        while ($ranges.Count -gt 0) {
+            $range = $ranges.Pop()
+            if ($range.Count -gt 256) {
+                $leftCount = [int][math]::Floor($range.Count / 2)
+                # Push right first so leaves combine in the same order as filesystem discovery.
+                $ranges.Push([PSCustomObject]@{ Start = $range.Start + $leftCount; Count = $range.Count - $leftCount })
+                $ranges.Push([PSCustomObject]@{ Start = $range.Start; Count = $leftCount })
                 continue
             }
 
-            if ($registeredProfilePaths.Contains($folderPath)) {
-                Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.residualFolderExcludedBecauseItIsStillAssociatedWithWin32Userprofile01' -Args @($folderName, $folderPath))
-                continue
-            }
+            for ($index = $range.Start; $index -lt $range.Start + $range.Count; $index++) {
+                $folder = $folders[$index]
+                $folderName = $folder.Name
+                $folderPath = [System.IO.Path]::GetFullPath($folder.FullName).TrimEnd('\')
 
-            if ($registeredSids -contains $folderName) {
-                Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.residualFolderExcludedBecauseSidStillRegistered01' -Args @($folderName, $folderPath))
-                continue
-            }
+                if ($excluded.Contains($folderName)) {
+                    Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.residualFolderExcludedForProtectedName01' -Args @($folderName, $folderPath))
+                    continue
+                }
 
-            # Keep the link exclusion at candidate selection as well as during initial enumeration.
-            if ($folder.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-                Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.residualFolderExcludedBecauseReparsePointSymlink01' -Args @($folderName, $folderPath))
-                continue
-            }
+                if ($registeredProfilePaths.Contains($folderPath)) {
+                    Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.residualFolderExcludedBecauseItIsStillAssociatedWithWin32Userprofile01' -Args @($folderName, $folderPath))
+                    continue
+                }
 
-            [PSCustomObject]@{
-                Name = $folderName
-                Path = $folderPath
+                if ($registeredSids.Contains($folderName)) {
+                    Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.residualFolderExcludedBecauseSidStillRegistered01' -Args @($folderName, $folderPath))
+                    continue
+                }
+
+                # Keep the link exclusion at candidate selection as well as during initial enumeration.
+                if ($folder.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                    Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.residualFolderExcludedBecauseReparsePointSymlink01' -Args @($folderName, $folderPath))
+                    continue
+                }
+
+                [PSCustomObject]@{
+                    Name = $folderName
+                    Path = $folderPath
+                }
             }
         }
     }
