@@ -6,7 +6,7 @@ function WinDeleteUserProfiles {
 
     .DESCRIPTION
         Performs a controlled cleanup of local profiles in C:\Users using Win32_UserProfile.
-        Excludes special and loaded profiles, system accounts, the current user profile, and protected names.
+        Excludes special and loaded profiles, built-in account SIDs, and Windows-managed profile paths.
         After deleting registered profiles, checks the users folder and removes residual directories that are no
         longer associated with profiles in the registry or CIM, while preserving all protected exclusions.
         Residual folders are divided into independent deletion tasks and processed with bounded parallelism.
@@ -61,41 +61,132 @@ function WinDeleteUserProfiles {
     $usersRoot = [System.IO.Path]::GetFullPath($UsersRoot.TrimEnd('\') + '\')
     $currentUser = $env:USERNAME
     $computerName = $env:COMPUTERNAME
-    # Resolve the current profile by SID because its folder name can differ from the account name.
+    # Account SIDs remain stable when account names or their displayed language change.
     $currentUserSid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
-    $currentUserProfilePath = (Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $_.SID -eq $currentUserSid } | Select-Object -First 1 -ExpandProperty LocalPath -ErrorAction SilentlyContinue)
-    if ($currentUserProfilePath -and $currentUserProfilePath.StartsWith($usersRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-        $currentUserFolder = [System.IO.Path]::GetFileName($currentUserProfilePath)
-    }
-    else {
-        $currentUserFolder = $currentUser
-    }
     $minimumLastUseDate = if ($MinimumProfileAgeDays -gt 0) { (Get-Date).AddDays(-$MinimumProfileAgeDays) } else { $null }
     $rebootRecommended = $false
     # Cap simultaneous CIM operations and the resources held by the worker batch.
     $maxThreadsEffective = [Math]::Min($MaxThreads, 4)
 
-    # Preserve shared/system folders and both names that can identify the current user's profile.
-    $protectedProfileNames = @(
-        'Public',
-        'Pubblica',
-        'Default',
-        'Default User',
-        'All Users',
-        'defaultuser0',
-        'WDAGUtilityAccount',
-        'Administrator',
-        'Guest',
-        $currentUser,
-        $currentUserFolder
-    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    # Windows APIs return configured paths independently of localized names or a profile's CIM registration.
+    function Get-ProfileProtectionSystemPath {
+        # Reuse the type when the toolkit invokes this tool again in the same PowerShell process.
+        if (-not ('WinToolkit.ProfileProtectionNativeMethods' -as [type])) {
+            Add-Type -Namespace 'WinToolkit' -Name 'ProfileProtectionNativeMethods' -MemberDefinition @'
+                [System.Runtime.InteropServices.DllImport("shell32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, ExactSpelling = true)]
+                public static extern int SHGetKnownFolderPath(ref System.Guid folderId, uint flags, System.IntPtr token, out System.IntPtr path);
 
-    # Apply the same case-insensitive name exclusions to registered profiles and residual folders.
-    function New-ProtectedNameSet {
-        $excluded = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        $protectedProfileNames | ForEach-Object { [void]$excluded.Add($_) }
-        # The unary comma returns the set itself instead of enumerating its entries into the pipeline.
-        return , $excluded
+                [System.Runtime.InteropServices.DllImport("userenv.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+                [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+                public static extern bool GetDefaultUserProfileDirectoryW(System.Text.StringBuilder path, ref uint size);
+'@ -ErrorAction Stop
+        }
+
+        $publicFolderId = [guid]'DFDF76A2-C82A-4D63-906A-5644AC457385'
+        $publicPathBuffer = [IntPtr]::Zero
+        try {
+            # KF_FLAG_DONT_VERIFY retrieves the configured path even if the shared folder is missing.
+            $status = [WinToolkit.ProfileProtectionNativeMethods]::SHGetKnownFolderPath(
+                [ref]$publicFolderId, 0x4000, [IntPtr]::Zero, [ref]$publicPathBuffer)
+            if ($status -lt 0) { [System.Runtime.InteropServices.Marshal]::ThrowExceptionForHR($status) }
+            $publicPath = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($publicPathBuffer)
+        }
+        finally {
+            # The shell allocates this buffer; release it on both successful and failed queries.
+            if ($publicPathBuffer -ne [IntPtr]::Zero) {
+                [System.Runtime.InteropServices.Marshal]::FreeCoTaskMem($publicPathBuffer)
+            }
+        }
+
+        [uint32]$defaultPathSize = 0
+        [void][WinToolkit.ProfileProtectionNativeMethods]::GetDefaultUserProfileDirectoryW($null, [ref]$defaultPathSize)
+        if ($defaultPathSize -eq 0) {
+            throw [System.ComponentModel.Win32Exception]::new([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())
+        }
+        $defaultPathBuffer = [System.Text.StringBuilder]::new([int]$defaultPathSize)
+        if (-not [WinToolkit.ProfileProtectionNativeMethods]::GetDefaultUserProfileDirectoryW($defaultPathBuffer, [ref]$defaultPathSize)) {
+            throw [System.ComponentModel.Win32Exception]::new([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())
+        }
+
+        [pscustomobject]@{
+            CurrentUser = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile, [Environment+SpecialFolderOption]::DoNotVerify)
+            Public = $publicPath
+            Default = $defaultPathBuffer.ToString()
+            AllUsers = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData, [Environment+SpecialFolderOption]::DoNotVerify)
+        }
+    }
+
+    # Retain protected identities and their paths across both cleanup phases, even if registration disappears.
+    function New-ProfileProtectionState {
+        $protectedSids = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $protectedPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        if ([string]::IsNullOrWhiteSpace($currentUserSid)) {
+            throw [System.InvalidOperationException]::new('The current user SID cannot be resolved for profile protection.')
+        }
+        [void]$protectedSids.Add($currentUserSid)
+
+        $systemPaths = Get-ProfileProtectionSystemPath
+        foreach ($pathKind in @('CurrentUser', 'Public', 'Default', 'AllUsers')) {
+            $path = $systemPaths.$pathKind
+            if ([string]::IsNullOrWhiteSpace($path) -or -not [System.IO.Path]::IsPathRooted($path)) {
+                throw [System.InvalidOperationException]::new("The Windows '$pathKind' path cannot be resolved for profile protection.")
+            }
+            [void]$protectedPaths.Add([System.IO.Path]::GetFullPath($path).TrimEnd('\'))
+        }
+        # Preserve the existing invariant Windows setup-folder exception; it is not DefaultAccount (RID 503).
+        [void]$protectedPaths.Add([System.IO.Path]::GetFullPath($usersRoot + 'defaultuser0').TrimEnd('\'))
+
+        try {
+            $profiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop
+        }
+        catch {
+            Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.cimProfileDetectionFailed0' -Args @($($_.Exception.Message)))
+            # An incomplete protection snapshot must stop cleanup before any deletion is scheduled.
+            throw
+        }
+        foreach ($profileItem in $profiles) {
+            # RIDs 500/501 identify Administrator/Guest; 503/504 identify DefaultAccount/WDAGUtilityAccount.
+            # Qualify the account SID namespace: unrelated SIDs ending in the same RID are not these accounts.
+            $isProtectedSid = $profileItem.SID -eq $currentUserSid -or
+                $profileItem.SID -match '^S-1-5-21-\d+-\d+-\d+-(500|501|503|504)$'
+            if ($isProtectedSid -or $profileItem.Special -ne $false -or $profileItem.Loaded -ne $false) {
+                if ([string]::IsNullOrWhiteSpace($profileItem.SID) -or
+                    [string]::IsNullOrWhiteSpace($profileItem.LocalPath) -or
+                    -not [System.IO.Path]::IsPathRooted($profileItem.LocalPath)) {
+                    throw [System.InvalidOperationException]::new('A protected Windows profile has incomplete identity or path metadata.')
+                }
+                [void]$protectedSids.Add($profileItem.SID)
+                [void]$protectedPaths.Add([System.IO.Path]::GetFullPath($profileItem.LocalPath).TrimEnd('\'))
+            }
+        }
+
+        [pscustomobject]@{ Sids = $protectedSids; Paths = $protectedPaths }
+    }
+
+    # One language-independent policy covers registered profiles and residual directories.
+    function Test-ProfileProtection {
+        param(
+            [Parameter(Mandatory = $true)][object]$Protection,
+            [Parameter(Mandatory = $true)][string]$Path,
+            [string]$Sid
+        )
+
+        if ($null -eq $Protection.Sids -or $null -eq $Protection.Paths) {
+            throw [System.InvalidOperationException]::new('Profile protection must be initialized before candidate discovery.')
+        }
+        if ($Protection.Sids.Contains($Sid) -or $Sid -match '^S-1-5-21-\d+-\d+-\d+-(500|501|503|504)$') {
+            return $true
+        }
+        $candidatePath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+        if ($Protection.Paths.Contains($candidatePath)) { return $true }
+        foreach ($protectedPath in $Protection.Paths) {
+            # Also preserve ancestors/descendants when UsersRoot overlaps a protected directory.
+            if ($candidatePath.StartsWith($protectedPath + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
+                $protectedPath.StartsWith($candidatePath + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        }
+        return $false
     }
 
     # Remove leftover ProfileList state after the profile directory is gone, reporting registry failure separately.
@@ -219,8 +310,6 @@ function WinDeleteUserProfiles {
 
     # Select unloaded, non-special profiles under the configured root before scheduling destructive work.
     function Get-RemovableUserProfiles {
-        $excluded = New-ProtectedNameSet
-
         Write-StyledMessage -Type 'Info' -Text ("🔍 " + (Get-SourceTextLoc 'toolText.scanningRegisteredLocalProfiles'))
         Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.scanningRegisteredLocalProfiles')
 
@@ -230,28 +319,22 @@ function WinDeleteUserProfiles {
         catch {
             Write-ToolkitLog -Level 'WARNING' -Message (Get-SourceTextLoc 'toolText.cimProfileDetectionFailed0' -Args @($($_.Exception.Message)))
             Write-StyledMessage -Type 'Warning' -Text ((Get-SourceTextLoc 'toolText.cimProfileDetectionFailed0' -Args @($($_.Exception.Message))))
-            return
+            throw
         }
 
         # Active sessions and Windows-managed special profiles must keep their profile data.
         $profiles = $profiles | Where-Object {
-            -not $_.Special -and
-            -not $_.Loaded -and
+            $_.Special -eq $false -and
+            $_.Loaded -eq $false -and
             $_.LocalPath -and
-            $_.LocalPath.StartsWith($usersRoot, [System.StringComparison]::OrdinalIgnoreCase)
+            [System.IO.Path]::GetFullPath($_.LocalPath).StartsWith($usersRoot, [System.StringComparison]::OrdinalIgnoreCase)
         }
 
         foreach ($profileItem in $profiles) {
-            $profileName = [System.IO.Path]::GetFileName($profileItem.LocalPath)
+            $profileName = [System.IO.Path]::GetFileName($profileItem.LocalPath.TrimEnd('\'))
 
-            if ($excluded.Contains($profileName)) {
+            if (Test-ProfileProtection -Protection $profileProtection -Path $profileItem.LocalPath -Sid $profileItem.SID) {
                 Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.excludedProfile01' -Args @($profileName, $($profileItem.LocalPath)))
-                continue
-            }
-
-            # Protect the current account independently of folder-name exclusions.
-            if ($profileItem.SID -eq $currentUserSid) {
-                Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.excludedProfileBecauseSidMatchesCurrentUser0' -Args @($profileName, $profileItem.SID))
                 continue
             }
 
@@ -956,9 +1039,8 @@ function WinDeleteUserProfiles {
         }
     }
 
-    # Select leftovers from balanced index ranges while preserving name, CIM-path, SID, and link exclusions.
+    # Select leftovers from balanced index ranges while preserving protected paths, CIM paths, SIDs, and links.
     function Get-ResidualUserFolders {
-        $excluded = New-ProtectedNameSet
         # Refresh registration after profile removal so this scan reflects the state Windows now reports.
         $registeredProfilePaths = Get-RegisteredProfilePathSet
 
@@ -1014,8 +1096,8 @@ function WinDeleteUserProfiles {
                 $folderName = $folder.Name
                 $folderPath = [System.IO.Path]::GetFullPath($folder.FullName).TrimEnd('\')
 
-                if ($excluded.Contains($folderName)) {
-                    Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.residualFolderExcludedForProtectedName01' -Args @($folderName, $folderPath))
+                if (Test-ProfileProtection -Protection $profileProtection -Path $folderPath -Sid $folderName) {
+                    Write-ToolkitLog -Level 'INFO' -Message (Get-SourceTextLoc 'toolText.excludedProfile01' -Args @($folderName, $folderPath))
                     continue
                 }
 
@@ -1234,6 +1316,9 @@ function WinDeleteUserProfiles {
         if (-not (Test-Path -LiteralPath $usersRoot -PathType Container)) {
             throw (Get-SourceTextLoc 'toolText.extra.profilePathDoesNotExist0' -Args @($usersRoot))
         }
+
+        # Discover all mandatory protections before the first cleanup phase can schedule destructive work.
+        $profileProtection = New-ProfileProtectionState
 
         $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
         if ($os -and $os.Caption -notmatch 'Windows 11') {

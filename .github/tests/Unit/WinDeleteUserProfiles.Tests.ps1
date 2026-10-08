@@ -8,6 +8,10 @@ Deletion commands are mocked; folder removal tests use empty TestDrive directori
 # Pester callbacks and imported coordinator bodies read these values dynamically.
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'CompiledScriptPath', Justification = 'Used by Pester callbacks to select source or compiled definitions.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'maxThreadsEffective', Justification = 'Read from the test scope by the AST-extracted batch coordinators.')]
+# AST-imported discovery functions read these values from the Pester callback scope.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'usersRoot', Justification = 'Read dynamically by the AST-imported profile protection and discovery functions.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'currentUserSid', Justification = 'Read dynamically by the AST-imported profile protection factory.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'minimumLastUseDate', Justification = 'Read dynamically by the AST-imported registered-profile discovery function.')]
 # Exercise the production global-state contract; BeforeAll saves it and AfterAll restores it.
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', 'Global:SourceTextLanguageData', Justification = 'Worker localization state is explicitly saved and restored.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', 'Global:SourceTextDefaultLanguageData', Justification = 'Worker fallback localization state is explicitly saved and restored.')]
@@ -33,7 +37,10 @@ Describe 'Issue #189 safe regressions' {
             @{ Path = $toolPath; Name = 'Close-ProfileRemovalPowerShell' },
             @{ Path = $toolPath; Name = 'New-ProfileDirectoryEnumerator' },
             @{ Path = $toolPath; Name = 'Get-ProfileCleanupSubtrees' },
-            @{ Path = $toolPath; Name = 'New-ProtectedNameSet' },
+            @{ Path = $toolPath; Name = 'Get-ProfileProtectionSystemPath' },
+            @{ Path = $toolPath; Name = 'New-ProfileProtectionState' },
+            @{ Path = $toolPath; Name = 'Test-ProfileProtection' },
+            @{ Path = $toolPath; Name = 'Get-RemovableUserProfiles' },
             @{ Path = $toolPath; Name = 'Get-RegisteredProfilePathSet' },
             @{ Path = $toolPath; Name = 'Get-ProfileCleanupPathAttribute' },
             @{ Path = $toolPath; Name = 'Test-ProfileCleanupDirectory' },
@@ -1394,15 +1401,219 @@ if (-not [System.IO.Directory]::Exists($LiteralPath)) {
         }
     }
 
+    Context 'Language-independent profile protection without deletion' {
+        BeforeEach {
+            $usersRoot = 'D:\Profiles\'
+            $currentUserSid = 'S-1-5-21-111-222-333-1009'
+            $minimumLastUseDate = $null
+            $script:ProtectionSystemPaths = [pscustomobject]@{
+                CurrentUser = 'D:\Profiles\Current.OnDisk'
+                Public = 'D:\Profiles\Shared.Relocated'
+                Default = 'D:\Profiles\Template.Relocated'
+                AllUsers = 'E:\SharedApplicationData'
+            }
+            $script:ProtectionProfiles = @()
+            Mock Get-ProfileProtectionSystemPath { $script:ProtectionSystemPaths }
+            Mock Get-CimInstance { $script:ProtectionProfiles }
+            Mock Write-StyledMessage {}
+            Mock Write-ToolkitLog {}
+        }
+
+        It 'protects configured full paths without translated folder-name lists' {
+            $protection = New-ProfileProtectionState
+
+            $protection.Sids.Contains($currentUserSid) | Should -BeTrue
+            foreach ($path in $script:ProtectionSystemPaths.PSObject.Properties.Value) {
+                Test-ProfileProtection -Protection $protection -Path $path.ToUpperInvariant() | Should -BeTrue
+            }
+            Test-ProfileProtection -Protection $protection -Path ($usersRoot + 'defaultuser0') | Should -BeTrue
+            Test-ProfileProtection -Protection $protection -Path 'D:\Other\Shared.Relocated' | Should -BeFalse
+            Test-ProfileProtection -Protection $protection -Path 'D:\Profiles\Shared.Relocated2' | Should -BeFalse
+            Should -Invoke Get-CimInstance -Times 1 -Exactly -ParameterFilter { $ClassName -eq 'Win32_UserProfile' -and $ErrorAction -eq 'Stop' }
+        }
+
+        It 'protects renamed built-in account RID <Rid> by its qualified SID' -ForEach @(
+            @{ Rid = 500 }, @{ Rid = 501 }, @{ Rid = 503 }, @{ Rid = 504 }
+        ) {
+            $script:ProtectionProfiles = @([pscustomobject]@{
+                SID = "S-1-5-21-111-222-333-$Rid"; LocalPath = $usersRoot + "RenamedAccount$Rid"
+                Special = $false; Loaded = $false
+            })
+            $profileProtection = New-ProfileProtectionState
+
+            $profileProtection.Sids.Contains($script:ProtectionProfiles[0].SID) | Should -BeTrue
+            $profileProtection.Paths.Contains($script:ProtectionProfiles[0].LocalPath) | Should -BeTrue
+            @(Get-RemovableUserProfiles).Count | Should -Be 0
+        }
+
+        It 'does not protect an unrelated SID <Sid> or an account display name' -ForEach @(
+            @{ Sid = 'S-1-5-21-111-222-333-1001' },
+            @{ Sid = 'S-1-5-32-500' },
+            @{ Sid = 'S-1-5-21-111-500' }
+        ) {
+            $script:ProtectionProfiles = @([pscustomobject]@{
+                SID = $Sid; LocalPath = $usersRoot + 'Administrator'
+                Special = $false; Loaded = $false
+            })
+            $profileProtection = New-ProfileProtectionState
+
+            $profileProtection.Sids.Contains($Sid) | Should -BeFalse
+            @(Get-RemovableUserProfiles).Count | Should -Be 1
+        }
+
+        It 'protects both the current SID mapping and the Windows current-profile path' {
+            $script:ProtectionProfiles = @([pscustomobject]@{
+                SID = $currentUserSid; LocalPath = $usersRoot + 'RenamedCurrentAccount'
+                Special = $false; Loaded = $false
+            })
+            $profileProtection = New-ProfileProtectionState
+            $script:ProtectionProfiles += [pscustomobject]@{
+                SID = 'S-1-5-21-111-222-333-1010'; LocalPath = $script:ProtectionSystemPaths.CurrentUser
+                Special = $false; Loaded = $false
+            }
+
+            $profileProtection.Paths.Contains($usersRoot + 'RenamedCurrentAccount') | Should -BeTrue
+            $profileProtection.Paths.Contains($script:ProtectionSystemPaths.CurrentUser) | Should -BeTrue
+            @(Get-RemovableUserProfiles).Count | Should -Be 0
+        }
+
+        It 'retains paths with <State> metadata after their CIM registration disappears' -ForEach @(
+            @{ State = 'Loaded'; Loaded = $true; Special = $false },
+            @{ State = 'Special'; Loaded = $false; Special = $true },
+            @{ State = 'UnknownLoaded'; Loaded = $null; Special = $false },
+            @{ State = 'UnknownSpecial'; Loaded = $false; Special = $null }
+        ) {
+            $script:ProtectionProfiles = @([pscustomobject]@{
+                SID = 'S-1-5-21-111-222-333-1010'; LocalPath = $usersRoot + 'Protected.Initially'
+                Special = $Special; Loaded = $Loaded
+            })
+            $protection = New-ProfileProtectionState
+            $script:ProtectionProfiles = @()
+
+            Test-ProfileProtection -Protection $protection -Path ($usersRoot + 'PROTECTED.INITIALLY\') | Should -BeTrue
+        }
+
+        It 'preserves an overlapping protected path <Path> without matching its sibling' -ForEach @(
+            @{ Path = 'D:\Profiles\Shared.Relocated\Child' },
+            @{ Path = 'D:\Profiles' },
+            @{ Path = 'D:\Profiles\Unused\..\Shared.Relocated\' }
+        ) {
+            $protection = New-ProfileProtectionState
+
+            Test-ProfileProtection -Protection $protection -Path $Path | Should -BeTrue
+            Test-ProfileProtection -Protection $protection -Path 'D:\Profiles2' | Should -BeFalse
+        }
+
+        It 'stops protection discovery when Windows path <Kind> is unavailable' -ForEach @(
+            @{ Kind = 'CurrentUser' }, @{ Kind = 'Public' }, @{ Kind = 'Default' }, @{ Kind = 'AllUsers' }
+        ) {
+            $script:ProtectionSystemPaths.$Kind = ''
+
+            { New-ProfileProtectionState } | Should -Throw '*cannot be resolved*'
+
+            Should -Invoke Get-CimInstance -Times 0 -Exactly
+        }
+
+        It 'stops protection discovery on native path or CIM failure' -ForEach @(
+            @{ Failure = 'NativePath' }, @{ Failure = 'CIM' }
+        ) {
+            if ($Failure -eq 'NativePath') {
+                Mock Get-ProfileProtectionSystemPath { throw 'Synthetic native path failure' }
+            }
+            else { Mock Get-CimInstance { throw 'Synthetic CIM failure' } }
+
+            { New-ProfileProtectionState } | Should -Throw '*Synthetic*failure*'
+        }
+
+        It 'rejects incomplete protected profile metadata' {
+            $script:ProtectionProfiles = @([pscustomobject]@{
+                SID = 'S-1-5-21-111-222-333-500'; LocalPath = ''
+                Special = $false; Loaded = $false
+            })
+
+            { New-ProfileProtectionState } | Should -Throw '*incomplete identity or path metadata*'
+        }
+
+        It 'rejects a relative Windows protection path' {
+            $script:ProtectionSystemPaths.Public = 'Profiles\Shared'
+
+            { New-ProfileProtectionState } | Should -Throw '*cannot be resolved*'
+        }
+
+        It 'rejects an unresolved current SID' {
+            $currentUserSid = ''
+
+            { New-ProfileProtectionState } | Should -Throw '*current user SID cannot be resolved*'
+            [string]::IsNullOrWhiteSpace($currentUserSid) | Should -BeTrue
+            Should -Invoke Get-ProfileProtectionSystemPath -Times 0 -Exactly
+        }
+
+        It 'rejects an uninitialized protection structure' {
+            { Test-ProfileProtection -Protection ([pscustomobject]@{}) -Path 'D:\Profiles\Orphan' } | Should -Throw '*must be initialized*'
+        }
+
+        It 'stops registered discovery on CIM failure' {
+            $profileProtection = New-ProfileProtectionState
+            Mock Get-CimInstance { throw 'Synthetic registered discovery failure' }
+
+            { Get-RemovableUserProfiles } | Should -Throw '*Synthetic registered discovery failure*'
+            $profileProtection.Paths.Count | Should -BeGreaterThan 0
+        }
+
+        It 'preserves age and root filters for ordinary accounts' {
+            $minimumLastUseDate = (Get-Date).AddDays(-30)
+            $script:ProtectionProfiles = @(
+                [pscustomobject]@{ SID = 'S-1-5-21-111-222-333-1010'; LocalPath = $usersRoot + 'Old'; Special = $false; Loaded = $false; LastUseTime = (Get-Date).AddDays(-40) },
+                [pscustomobject]@{ SID = 'S-1-5-21-111-222-333-1011'; LocalPath = $usersRoot + 'Recent'; Special = $false; Loaded = $false; LastUseTime = Get-Date },
+                [pscustomobject]@{ SID = 'S-1-5-21-111-222-333-1012'; LocalPath = 'D:\Profiles2\Outside'; Special = $false; Loaded = $false },
+                [pscustomobject]@{ SID = 'S-1-5-21-111-222-333-1013'; LocalPath = $usersRoot + '..\Outside'; Special = $false; Loaded = $false }
+            )
+            $profileProtection = New-ProfileProtectionState
+
+            $profileProtection.Paths.Count | Should -BeGreaterThan 0
+            $results = @(Get-RemovableUserProfiles)
+            $results.Count | Should -Be 1
+            $results[0].LocalPath | Should -Be ($usersRoot + 'Old')
+        }
+
+        It 'protects relocated system and renamed built-in residual folders without registration' {
+            $script:ProtectionProfiles = @([pscustomobject]@{
+                SID = 'S-1-5-21-111-222-333-503'; LocalPath = $usersRoot + 'RenamedMaintenance'
+                Special = $false; Loaded = $false
+            })
+            $profileProtection = New-ProfileProtectionState
+            $script:ProtectionProfiles = @()
+            $script:ProtectionFolders = @('Current.OnDisk', 'Shared.Relocated', 'Template.Relocated', 'defaultuser0', 'RenamedMaintenance', 'Orphan')
+            Mock Get-ChildItem {
+                if ($LiteralPath -eq 'D:\Profiles\') {
+                    foreach ($name in $script:ProtectionFolders) {
+                        [pscustomobject]@{ Name = $name; FullName = "D:\Profiles\$name"; Attributes = [System.IO.FileAttributes]::Directory }
+                    }
+                }
+                elseif ($LiteralPath -notlike 'HKLM:*') { throw 'Unexpected discovery target' }
+            }
+            Mock Get-ItemProperty { throw 'There must be no registry profiles in this fixture' }
+
+            $profileProtection.Paths.Contains($usersRoot + 'RenamedMaintenance') | Should -BeTrue
+            $results = @(Get-ResidualUserFolders)
+            $results.Count | Should -Be 1
+            $results[0].Name | Should -Be 'Orphan'
+            Should -Invoke Get-ItemProperty -Times 0 -Exactly
+        }
+    }
+
     Context 'Residual discovery range partitioning without deletion' {
         BeforeEach {
             $usersRoot = 'C:\Users\Scan[Root]\'
             $script:ScanRoot = $usersRoot
             $script:ScanFolders = @()
             $script:ScanSids = @()
-            $script:ScanExcluded = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $profileProtection = [pscustomobject]@{
+                Sids = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                Paths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            }
+            $script:ScanProtectedPaths = $profileProtection.Paths
             $script:ScanRegistered = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-            Mock New-ProtectedNameSet { return , $script:ScanExcluded }
             Mock Get-RegisteredProfilePathSet { return , $script:ScanRegistered }
             Mock Get-ChildItem {
                 if ($LiteralPath -eq $script:ScanRoot) { foreach ($folder in $script:ScanFolders) { $folder } }
@@ -1479,14 +1690,14 @@ if (-not [System.IO.Directory]::Exists($LiteralPath)) {
             Should -Invoke Get-ChildItem -Times 2 -Exactly
         }
 
-        It 'preserves protected names, CIM paths, SID names, and link exclusions across partitions' {
+        It 'preserves protected paths, CIM paths, SID names, and link exclusions across partitions' {
             $script:ScanFolders = @(for ($index = 0; $index -lt 513; $index++) {
                 [pscustomobject]@{
                     Name = "Candidate[$index]"; FullName = "$($script:ScanRoot)Candidate[$index]"
                     Attributes = [System.IO.FileAttributes]::Directory
                 }
             })
-            [void]$script:ScanExcluded.Add('CANDIDATE[0]')
+            [void]$script:ScanProtectedPaths.Add($script:ScanFolders[0].FullName.ToUpperInvariant())
             [void]$script:ScanRegistered.Add($script:ScanFolders[256].FullName.ToUpperInvariant())
             $script:ScanSids = @('CANDIDATE[257]', 'CANDIDATE[257]')
             $script:ScanFolders[512].Attributes = [System.IO.FileAttributes]::ReparsePoint
