@@ -5,6 +5,17 @@ Regression coverage for issue #189 without deleting Windows profiles.
 Loads individual function definitions from the AST, never the tool or toolkit scripts.
 Deletion commands are mocked; folder removal tests use empty TestDrive directories.
 #>
+# Pester callbacks and imported coordinator bodies read these values dynamically.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'CompiledScriptPath', Justification = 'Used by Pester callbacks to select source or compiled definitions.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'maxThreadsEffective', Justification = 'Read from the test scope by the AST-extracted batch coordinators.')]
+# Exercise the production global-state contract; BeforeAll saves it and AfterAll restores it.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', 'Global:SourceTextLanguageData', Justification = 'Worker localization state is explicitly saved and restored.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', 'Global:SourceTextDefaultLanguageData', Justification = 'Worker fallback localization state is explicitly saved and restored.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', 'Global:SourceTextKeyAliases', Justification = 'Worker localization aliases are explicitly saved and restored.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', 'Global:CurrentLogFile', Justification = 'Worker log state is explicitly saved and restored.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', 'Global:CurrentToolName', Justification = 'Worker log context is explicitly saved and restored.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', 'Global:Spinners', Justification = 'Worker progress state is explicitly saved and restored.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', 'Global:GuiSessionActive', Justification = 'Worker console ownership state is explicitly saved and restored.')]
 param([string]$CompiledScriptPath)
 
 Describe 'Issue #189 safe regressions' {
@@ -222,7 +233,7 @@ Describe 'Issue #189 safe regressions' {
             $commands = [pscustomobject]@{}
             $commands | Add-Member -MemberType ScriptMethod -Name Clear -Value { throw 'Synthetic clear failure' }
             $powerShell = [pscustomobject]@{ Commands = $commands; Disposed = $false }
-            $powerShell | Add-Member -MemberType ScriptMethod -Name EndInvoke -Value { param($Handle) [pscustomobject]@{ Type = 'Profile'; Success = $true } }
+            $powerShell | Add-Member -MemberType ScriptMethod -Name EndInvoke -Value { [pscustomobject]@{ Type = 'Profile'; Success = $true } }
             $powerShell | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.Disposed = $true }
             $job = [pscustomobject]@{ PowerShell = $powerShell; Handle = $null }
 
@@ -266,7 +277,7 @@ Describe 'Issue #189 safe regressions' {
     Context 'Bounded native command capture with harmless child processes' {
         BeforeAll {
             $script:ProbeExecutable = (Get-Process -Id $PID).Path
-            function ConvertTo-ProfileProbeArguments {
+            function ConvertTo-ProfileProbeArgumentList {
                 param([string]$Code)
                 @('-NoLogo', '-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-EncodedCommand',
                     [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('$ProgressPreference = ''SilentlyContinue''; ' + $Code)))
@@ -274,7 +285,7 @@ Describe 'Issue #189 safe regressions' {
         }
 
         It 'drains megabytes on both pipes without retaining more than the diagnostic snippets' {
-            $arguments = ConvertTo-ProfileProbeArguments '[Console]::Out.Write((''o'' * 4194304)); [Console]::Error.Write((''e'' * 4194304))'
+            $arguments = ConvertTo-ProfileProbeArgumentList '[Console]::Out.Write((''o'' * 4194304)); [Console]::Error.Write((''e'' * 4194304))'
             $result = Invoke-ProfileCleanupCommand -Command $script:ProbeExecutable -Arguments $arguments
 
             $result.Success | Should -BeTrue
@@ -286,7 +297,7 @@ Describe 'Issue #189 safe regressions' {
         }
 
         It 'preserves short output and a nonzero exit code' {
-            $arguments = ConvertTo-ProfileProbeArguments '[Console]::Out.Write(''short output''); [Console]::Error.Write(''short error''); exit 3'
+            $arguments = ConvertTo-ProfileProbeArgumentList '[Console]::Out.Write(''short output''); [Console]::Error.Write(''short error''); exit 3'
             $result = Invoke-ProfileCleanupCommand -Command $script:ProbeExecutable -Arguments $arguments
 
             $result.Success | Should -BeFalse
@@ -305,7 +316,7 @@ Describe 'Issue #189 safe regressions' {
         }
 
         It 'allows a finite child to finish without a command timeout' {
-            $arguments = ConvertTo-ProfileProbeArguments '[Threading.Thread]::Sleep(2200); [Console]::Out.Write(''completed'')'
+            $arguments = ConvertTo-ProfileProbeArgumentList '[Threading.Thread]::Sleep(2200); [Console]::Out.Write(''completed'')'
             $result = Invoke-ProfileCleanupCommand -Command $script:ProbeExecutable -Arguments $arguments
 
             $result.Success | Should -BeTrue
@@ -325,7 +336,7 @@ Describe 'Issue #189 safe regressions' {
             $waitHandle = $null
             try {
                 [void]$worker.AddScript('param($Executable, $Arguments) Invoke-ProfileCleanupCommand -Command $Executable -Arguments $Arguments', $true).
-                    AddArgument($script:ProbeExecutable).AddArgument((ConvertTo-ProfileProbeArguments $code))
+                    AddArgument($script:ProbeExecutable).AddArgument((ConvertTo-ProfileProbeArgumentList $code))
                 $handle = $worker.BeginInvoke()
                 $waitHandle = $handle.AsyncWaitHandle
                 $startup = [Diagnostics.Stopwatch]::StartNew()
@@ -893,6 +904,9 @@ $scriptBlock = {
             . ([scriptblock]::Create($probeSource))
 
             function New-TrackedProfilePowerShell {
+                [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Allocates and tracks an in-memory test pipeline; the synthetic worker performs no system changes.')]
+                param()
+
                 $outstanding = $script:BatchCreatedPowerShells.Count - $script:BatchCollectedCount + 1
                 $script:BatchPeakOutstanding = [Math]::Max($script:BatchPeakOutstanding, $outstanding)
                 $powerShell = [PowerShell]::Create()
@@ -969,20 +983,20 @@ $scriptBlock = {
         It 'runs two children of one profile concurrently and finalizes after both finish' {
             $maxThreadsEffective = 2
             $script:BatchGate = [System.Threading.CountdownEvent]::new(2)
-            $profile = [pscustomobject]@{
+            $profileItem = [pscustomobject]@{
                 Name = 'Split'; LocalPath = 'C:\Users\Split'; SID = 'split'; DelayMilliseconds = 1; Remaining = $true
             }
-            $script:BatchSubtrees[$profile.LocalPath] = @('C:\Users\Split\Left', 'C:\Users\Split\Right')
+            $script:BatchSubtrees[$profileItem.LocalPath] = @('C:\Users\Split\Left', 'C:\Users\Split\Right')
             try {
-                $results = @(Invoke-ProfileRemovalBatch -Profiles @($profile))
+                $results = @(Invoke-ProfileRemovalBatch -Profiles @($profileItem))
 
                 $script:BatchGate.CurrentCount | Should -Be 0
                 $script:BatchPeakOutstanding | Should -Be 2
                 $script:BatchCreatedPowerShells.Count | Should -Be 4
                 $results.Count | Should -Be 1
                 $results[0].Success | Should -BeTrue
-                $results[0].Path | Should -Be $profile.LocalPath
-                $results[0].Sid | Should -Be $profile.SID
+                $results[0].Path | Should -Be $profileItem.LocalPath
+                $results[0].Sid | Should -Be $profileItem.SID
                 $results[0].Started | Should -BeLessThan (Get-Date).AddMilliseconds(-500)
                 $events = $script:BatchEvents.ToArray()
                 $events[-1] | Should -Be 'Finalize:C:\Users\Split'
@@ -998,7 +1012,7 @@ $scriptBlock = {
             $root = Join-Path $TestDrive 'Phased[Profile]'
             $children = @((Join-Path $root 'Left'), (Join-Path $root 'Right'))
             foreach ($path in $children) { [void][System.IO.Directory]::CreateDirectory($path) }
-            $profile = [pscustomobject]@{ LocalPath = $root; SID = 'S-1-5-21-189-777' }
+            $profileItem = [pscustomobject]@{ LocalPath = $root; SID = 'S-1-5-21-189-777' }
             $script:BatchSubtrees[$root] = $children
             $targets = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
             foreach ($path in @($root) + $children) { [void]$targets.Add($path) }
@@ -1058,7 +1072,7 @@ if (-not [System.IO.Directory]::Exists($LiteralPath)) {
                 return $sessionState
             }
 
-            $results = @(& $script:ProfileRemovalBatchInvoker -Profiles @($profile))
+            $results = @(& $script:ProfileRemovalBatchInvoker -Profiles @($profileItem))
 
             $results.Count | Should -Be 1
             $results[0].Success | Should -BeTrue
@@ -1077,11 +1091,11 @@ if (-not [System.IO.Directory]::Exists($LiteralPath)) {
         ) {
             $maxThreadsEffective = $Threads
             $profiles = @(for ($index = 0; $index -lt 3; $index++) {
-                $profile = [pscustomobject]@{
+                $profileItem = [pscustomobject]@{
                     Name = "Split$index"; LocalPath = "C:\Users\Split$index"; SID = "split$index"; DelayMilliseconds = 1; Remaining = $true
                 }
-                $script:BatchSubtrees[$profile.LocalPath] = @(for ($child = 0; $child -lt 5; $child++) { "$($profile.LocalPath)\Child$child" })
-                $profile
+                $script:BatchSubtrees[$profileItem.LocalPath] = @(for ($child = 0; $child -lt 5; $child++) { "$($profileItem.LocalPath)\Child$child" })
+                $profileItem
             })
 
             $results = @(Invoke-ProfileRemovalBatch -Profiles $profiles)
@@ -1096,9 +1110,9 @@ if (-not [System.IO.Directory]::Exists($LiteralPath)) {
             }
             $events = $script:BatchEvents.ToArray()
             @($events | Where-Object { $_ -like 'Folder:*' } | Sort-Object -Unique).Count | Should -Be 15
-            foreach ($profile in $profiles) {
-                $finalIndex = [array]::IndexOf($events, "Finalize:$($profile.LocalPath)")
-                foreach ($path in $script:BatchSubtrees[$profile.LocalPath]) {
+            foreach ($profileItem in $profiles) {
+                $finalIndex = [array]::IndexOf($events, "Finalize:$($profileItem.LocalPath)")
+                foreach ($path in $script:BatchSubtrees[$profileItem.LocalPath]) {
                     [array]::IndexOf($events, "Folder-End:$path") | Should -BeLessThan $finalIndex
                 }
             }
@@ -1107,12 +1121,12 @@ if (-not [System.IO.Directory]::Exists($LiteralPath)) {
 
         It 'attempts root recovery after a failed child and counts only the final profile result' {
             $maxThreadsEffective = 2
-            $profile = [pscustomobject]@{
+            $profileItem = [pscustomobject]@{
                 Name = 'Recovery'; LocalPath = 'C:\Users\Recovery'; SID = 'recovery'; DelayMilliseconds = 1; Remaining = $true
             }
-            $script:BatchSubtrees[$profile.LocalPath] = @('C:\Users\Recovery\Fail', 'C:\Users\Recovery\Next')
+            $script:BatchSubtrees[$profileItem.LocalPath] = @('C:\Users\Recovery\Fail', 'C:\Users\Recovery\Next')
 
-            $results = @(Invoke-ProfileRemovalBatch -Profiles @($profile))
+            $results = @(Invoke-ProfileRemovalBatch -Profiles @($profileItem))
 
             $results.Count | Should -Be 1
             $results[0].Success | Should -BeTrue
@@ -1125,16 +1139,16 @@ if (-not [System.IO.Directory]::Exists($LiteralPath)) {
 
         It 'disposes all workers if a child fails to start after profile preparation succeeded' {
             $maxThreadsEffective = 2
-            $profile = [pscustomobject]@{
+            $profileItem = [pscustomobject]@{
                 Name = 'ChildStartup'; LocalPath = 'C:\Users\ChildStartup'; SID = 'childStartup'; DelayMilliseconds = 1; Remaining = $true
             }
-            $script:BatchSubtrees[$profile.LocalPath] = @('C:\Users\ChildStartup\Left', 'C:\Users\ChildStartup\Right')
+            $script:BatchSubtrees[$profileItem.LocalPath] = @('C:\Users\ChildStartup\Left', 'C:\Users\ChildStartup\Right')
             Mock Invoke-ProfileProbeBeginInvoke {
                 if ($script:BatchCreatedPowerShells.Count -eq 3) { throw 'Synthetic child startup failure' }
                 $PowerShell.BeginInvoke()
             }
 
-            { Invoke-ProfileRemovalBatch -Profiles @($profile) } | Should -Throw '*Synthetic child startup failure*'
+            { Invoke-ProfileRemovalBatch -Profiles @($profileItem) } | Should -Throw '*Synthetic child startup failure*'
 
             $script:BatchCreatedPowerShells.Count | Should -Be 3
             $script:BatchCollectedCount | Should -Be 1
@@ -1145,12 +1159,12 @@ if (-not [System.IO.Directory]::Exists($LiteralPath)) {
             @{ Count = 0 }, @{ Count = 1 }
         ) {
             $maxThreadsEffective = 2
-            $profile = [pscustomobject]@{
+            $profileItem = [pscustomobject]@{
                 Name = 'Small'; LocalPath = 'C:\Users\Small'; SID = 'small'; DelayMilliseconds = 1; Remaining = $true; FinalFail = $true
             }
-            $script:BatchSubtrees[$profile.LocalPath] = @(for ($child = 0; $child -lt $Count; $child++) { "C:\Users\Small\Child$child" })
+            $script:BatchSubtrees[$profileItem.LocalPath] = @(for ($child = 0; $child -lt $Count; $child++) { "C:\Users\Small\Child$child" })
 
-            $results = @(Invoke-ProfileRemovalBatch -Profiles @($profile))
+            $results = @(Invoke-ProfileRemovalBatch -Profiles @($profileItem))
 
             $script:BatchCreatedPowerShells.Count | Should -Be 2
             $results.Count | Should -Be 1
@@ -1250,7 +1264,7 @@ if (-not [System.IO.Directory]::Exists($LiteralPath)) {
 
         It 'disposes an unfinished subtree cursor when collection fails' {
             $maxThreadsEffective = 2
-            $profile = [pscustomobject]@{ Name = 'Cursor'; LocalPath = 'C:\Users\Cursor'; SID = 'cursor'; DelayMilliseconds = 1; Remaining = $true }
+            $profileItem = [pscustomobject]@{ Name = 'Cursor'; LocalPath = 'C:\Users\Cursor'; SID = 'cursor'; DelayMilliseconds = 1; Remaining = $true }
             $script:AbandonedCursor = [pscustomobject]@{ Index = -1; Current = $null; Disposed = $false }
             $script:AbandonedCursor | Add-Member -MemberType ScriptMethod -Name MoveNext -Value {
                 $this.Index++
@@ -1266,7 +1280,7 @@ if (-not [System.IO.Directory]::Exists($LiteralPath)) {
                 return $result
             }
 
-            { Invoke-ProfileRemovalBatch -Profiles @($profile) } | Should -Throw '*Synthetic cursor collection failure*'
+            { Invoke-ProfileRemovalBatch -Profiles @($profileItem) } | Should -Throw '*Synthetic cursor collection failure*'
 
             $script:AbandonedCursor.Disposed | Should -BeTrue
             $script:AbandonedCursor.Index | Should -BeLessThan 10
@@ -1526,6 +1540,9 @@ $scriptBlock = {
             . ([scriptblock]::Create($probeSource))
 
             function New-TrackedResidualPowerShell {
+                [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Allocates and tracks an in-memory test pipeline; the synthetic worker performs no system changes.')]
+                param()
+
                 $outstanding = $script:ResidualCreatedPowerShells.Count - $script:ResidualCollectedCount + 1
                 $script:ResidualPeakOutstanding = [Math]::Max($script:ResidualPeakOutstanding, $outstanding)
                 $powerShell = [PowerShell]::Create()
