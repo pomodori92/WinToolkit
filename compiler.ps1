@@ -236,47 +236,21 @@ foreach ($file in $toolFiles) {
             $newLines = @()
             if ($startIndex -gt 0) { $newLines += $templateLines[0..($startIndex - 1)] }
             
-            # --- LOGICA DI DE-INCAPSULAMENTO (UNWRAP) ---
-            # If the tool file already includes the declaration 'function <name> { ... }', we remove it
-            # to avoid double nesting (catastrophic).
+            # Find the entry function in the AST: leading comments must not cause double nesting.
+            # Exact body offsets preserve parameters, nested helpers and braces inside strings.
             $processedFileLines = $fileLines
-            
-            if ($fileLines.Count -gt 0) {
-                # Trova il primo indice con contenuto significativo
-                $firstNonEmpty = -1
-                for ($i = 0; $i -lt $fileLines.Count; $i++) {
-                    if (-not [string]::IsNullOrWhiteSpace($fileLines[$i])) { $firstNonEmpty = $i; break }
-                }
-
-                if ($firstNonEmpty -ge 0) {
-                    $firstLine = $fileLines[$firstNonEmpty].Trim()
-                    # Case-Insensitive detection of the correct function
-                    if ($firstLine -match ("(?i)^function\s+" + [regex]::Escape($functionName) + "\s*\{")) {
-                        Write-StyledMessage 'Info' ((Get-SourceTextLoc 'sourceText.detectedInternalFunctionIn') + " '$functionName'. " + (Get-SourceTextLoc 'sourceText.applyingUnwrapping'))
-                        
-                        # We remove the declaration line
-                        if ($firstNonEmpty -eq 0) {
-                            if ($fileLines.Count -gt 1) { $processedFileLines = $fileLines[1..($fileLines.Count - 1)] } else { $processedFileLines = @() }
-                        }
-                        else {
-                            $processedFileLines = $fileLines[0..($firstNonEmpty - 1)] + $fileLines[($firstNonEmpty + 1)..($fileLines.Count - 1)]
-                        }
-                        
-                        # We remove any final closing brace '}' (last non-empty line)
-                        $lastNonEmpty = -1
-                        for ($j = $processedFileLines.Count - 1; $j -ge 0; $j--) {
-                            if (-not [string]::IsNullOrWhiteSpace($processedFileLines[$j])) { $lastNonEmpty = $j; break }
-                        }
-                        if ($lastNonEmpty -ge 0 -and $processedFileLines[$lastNonEmpty].Trim() -eq "}") {
-                            if ($lastNonEmpty -eq ($processedFileLines.Count - 1)) {
-                                if ($processedFileLines.Count -gt 1) { $processedFileLines = $processedFileLines[0..($processedFileLines.Count - 2)] } else { $processedFileLines = @() }
-                            }
-                            else {
-                                $processedFileLines = $processedFileLines[0..($lastNonEmpty - 1)] + $processedFileLines[($lastNonEmpty + 1)..($processedFileLines.Count - 1)]
-                            }
-                        }
-                    }
-                }
+            $toolSource = $fileLines -join "`n"
+            $toolAst = [System.Management.Automation.Language.Parser]::ParseInput($toolSource, [ref]$null, [ref]$null)
+            $entryFunction = $toolAst.EndBlock.Statements | Select-Object -First 1
+            if ($entryFunction -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $entryFunction.Name -eq $functionName) {
+                Write-StyledMessage 'Info' ((Get-SourceTextLoc 'sourceText.detectedInternalFunctionIn') + " '$functionName'. " + (Get-SourceTextLoc 'sourceText.applyingUnwrapping'))
+                $bodyExtent = $entryFunction.Body.Extent
+                $bodyStart = $bodyExtent.StartOffset + 1
+                $bodyLength = $bodyExtent.EndOffset - $bodyStart - 1
+                $processedSource = $toolSource.Substring(0, $entryFunction.Extent.StartOffset) +
+                    $toolSource.Substring($bodyStart, $bodyLength) +
+                    $toolSource.Substring($entryFunction.Extent.EndOffset)
+                $processedFileLines = $processedSource -split "`n"
             }
             
             # --- LOGGING AND RE-INSERTION ---
