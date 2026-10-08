@@ -24,6 +24,7 @@ Describe 'Issue #189 safe regressions' {
             @{ Path = $toolPath; Name = 'Get-ProfileCleanupSubtrees' },
             @{ Path = $toolPath; Name = 'New-ProtectedNameSet' },
             @{ Path = $toolPath; Name = 'Get-RegisteredProfilePathSet' },
+            @{ Path = $toolPath; Name = 'Get-ProfileCleanupPathAttribute' },
             @{ Path = $toolPath; Name = 'Test-ProfileCleanupDirectory' },
             @{ Path = $toolPath; Name = 'Assert-ProfileCleanupProfileState' },
             @{ Path = $toolPath; Name = 'Get-ResidualUserFolders' },
@@ -160,6 +161,7 @@ Describe 'Issue #189 safe regressions' {
                     ToolName = $Global:CurrentToolName
                     Helpers = @(
                         'Get-SourceTextLoc', 'Write-ToolkitLog', 'Invoke-ProfileCleanupCommand',
+                        'Get-ProfileCleanupPathAttribute',
                         'Test-ProfileCleanupDirectory', 'Assert-ProfileCleanupProfileState',
                         'Remove-ItemSafely', 'Remove-ProfileRegistryEntries', 'Remove-ResidualUserFolder', 'Get-SpinnerChar',
                         'Clear-ProgressLine', 'Write-ProgressUpdate'
@@ -172,7 +174,7 @@ Describe 'Issue #189 safe regressions' {
                 $result.Message | Should -Be 'Profili registrati rimossi: 0'
                 $result.LogPath | Should -Be $Global:CurrentLogFile
                 $result.ToolName | Should -Be 'Issue189Probe'
-                $result.Helpers.Count | Should -Be 11
+                $result.Helpers.Count | Should -Be 12
             }
             $logLines = @(Get-Content -LiteralPath $Global:CurrentLogFile | Where-Object { $_ -match '\[INFO\]' })
             $logLines.Count | Should -Be 4
@@ -356,7 +358,7 @@ Describe 'Issue #189 safe regressions' {
         It 'does not turn <Failure> into confirmed absence' -ForEach @(
             @{ Failure = 'Access' }, @{ Failure = 'IO' }
         ) {
-            Mock Get-Item {
+            Mock Get-ProfileCleanupPathAttribute {
                 if ($Failure -eq 'Access') { throw [System.UnauthorizedAccessException]::new('Synthetic access failure') }
                 throw [System.IO.IOException]::new('Synthetic I/O failure')
             }
@@ -369,6 +371,18 @@ Describe 'Issue #189 safe regressions' {
             Set-Content -LiteralPath $path -Value 'Owned test fixture'
 
             { Test-ProfileCleanupDirectory -Path $path } | Should -Throw '*not a directory*'
+        }
+
+        It 'does not report absence when <MissingError> also hides an unavailable volume' -ForEach @(
+            @{ MissingError = 'File' }, @{ MissingError = 'Directory' }
+        ) {
+            Mock Get-ProfileCleanupPathAttribute {
+                if ($Path -eq 'C:\') { throw [System.IO.IOException]::new('Synthetic volume unavailable') }
+                if ($MissingError -eq 'File') { throw [System.IO.FileNotFoundException]::new('Synthetic missing path') }
+                throw [System.IO.DirectoryNotFoundException]::new('Synthetic missing path')
+            }
+
+            { Test-ProfileCleanupDirectory -Path 'C:\ReviewMock\Missing' } | Should -Throw '*volume unavailable*'
         }
     }
 
@@ -489,7 +503,7 @@ Describe 'Issue #189 safe regressions' {
         }
 
         It 'skips a child that has become a reparse point after partitioning' {
-            Mock Get-Item { [pscustomobject]@{ Attributes = [System.IO.FileAttributes]::ReparsePoint } }
+            Mock Get-ProfileCleanupPathAttribute { [System.IO.FileAttributes]::ReparsePoint }
 
             { & $script:ProfileRemovalWorker $script:ProbeProfile 'Folder' } | Should -Throw '*reparse point*'
             Should -Invoke Remove-Item -Times 0 -Exactly
@@ -500,7 +514,7 @@ Describe 'Issue #189 safe regressions' {
         It 'rejects a reparse root before any cleanup in <Phase>' -ForEach @(
             @{ Phase = 'Prepare' }, @{ Phase = 'Complete' }, @{ Phase = 'Finalize' }
         ) {
-            Mock Get-Item { [pscustomobject]@{ Attributes = [System.IO.FileAttributes]::ReparsePoint } }
+            Mock Get-ProfileCleanupPathAttribute { [System.IO.FileAttributes]::ReparsePoint }
 
             { & $script:ProfileRemovalWorker $script:ProbeProfile $Phase } | Should -Throw '*reparse point*'
 
@@ -563,11 +577,9 @@ Describe 'Issue #189 safe regressions' {
 
         It 'stops deletion and ACL recovery when robocopy is followed by a replaced link' {
             $script:TargetBecameLink = $false
-            Mock Get-Item {
-                [pscustomobject]@{
-                    PSIsContainer = $true
-                    Attributes = $(if ($script:TargetBecameLink) { [System.IO.FileAttributes]::ReparsePoint } else { [System.IO.FileAttributes]::Directory })
-                }
+            Mock Get-ProfileCleanupPathAttribute {
+                if ($script:TargetBecameLink) { [System.IO.FileAttributes]::ReparsePoint }
+                else { [System.IO.FileAttributes]::Directory }
             }
             Mock Invoke-ProfileCleanupCommand { $script:TargetBecameLink = $true }
 
@@ -580,7 +592,7 @@ Describe 'Issue #189 safe regressions' {
         }
 
         It 'keeps registration when directory inspection fails before cleanup' {
-            Mock Get-Item { throw [System.UnauthorizedAccessException]::new('Synthetic directory denial') }
+            Mock Get-ProfileCleanupPathAttribute { throw [System.UnauthorizedAccessException]::new('Synthetic directory denial') }
 
             { & $script:ProfileRemovalWorker $script:ProbeProfile 'Finalize' } | Should -Throw '*Synthetic directory denial*'
 
@@ -591,9 +603,9 @@ Describe 'Issue #189 safe regressions' {
 
         It 'keeps registration when post-deletion inspection fails' {
             $script:InspectionFailed = $false
-            Mock Get-Item {
+            Mock Get-ProfileCleanupPathAttribute {
                 if ($script:InspectionFailed) { throw [System.IO.IOException]::new('Synthetic verification I/O failure') }
-                [pscustomobject]@{ PSIsContainer = $true; Attributes = [System.IO.FileAttributes]::Directory }
+                [System.IO.FileAttributes]::Directory
             }
             # The mocked command changes inspection state and never deletes the fixture.
             Mock Remove-Item { $script:InspectionFailed = $true }
@@ -606,7 +618,7 @@ Describe 'Issue #189 safe regressions' {
         }
 
         It 'rejects a residual candidate replaced by a link before its worker starts' {
-            Mock Get-Item { [pscustomobject]@{ Attributes = [System.IO.FileAttributes]::ReparsePoint } }
+            Mock Get-ProfileCleanupPathAttribute { [System.IO.FileAttributes]::ReparsePoint }
             $folder = [pscustomobject]@{ Name = 'ReplacedLink'; Path = $script:ProbeFolderPath }
 
             (Remove-ResidualUserFolder -Folder $folder).Success | Should -BeFalse
@@ -996,6 +1008,13 @@ $scriptBlock = {
                 $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('FixtureRoot', $root, ''))
                 $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('FixtureEvents', $script:BatchEvents, ''))
                 $stubs = @{
+                    'Get-ProfileCleanupPathAttribute' = @'
+param($Path)
+if (-not $FixtureTargets.Contains($Path) -and $Path -ne [System.IO.Path]::GetPathRoot($FixtureRoot)) {
+    throw 'Unexpected fixture inspection target'
+}
+[System.IO.File]::GetAttributes($Path)
+'@
                     'Test-ProfileCleanupDirectory' = (Get-Command Test-ProfileCleanupDirectory).Definition
                     'Assert-ProfileCleanupProfileState' = (Get-Command Assert-ProfileCleanupProfileState).Definition
                     'Get-CimInstance' = @'

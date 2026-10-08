@@ -166,21 +166,33 @@ function WinDeleteUserProfiles {
         return , $pathSet
     }
 
+    # Native metadata reads preserve literal paths and expose errors that Directory.Exists suppresses.
+    function Get-ProfileCleanupPathAttribute {
+        param([Parameter(Mandatory = $true)][string]$Path)
+        return [System.IO.File]::GetAttributes($Path)
+    }
+
     # Only a path-not-found error proves absence; access and I/O failures must preserve profile registration.
     function Test-ProfileCleanupDirectory {
         param([Parameter(Mandatory = $true)][string]$Path)
 
         try {
-            $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+            $attributes = Get-ProfileCleanupPathAttribute -Path $Path
         }
-        catch [System.Management.Automation.ItemNotFoundException] {
+        catch [System.IO.FileNotFoundException] {
+            # A missing volume or network share must not masquerade as a deleted profile directory.
+            [void](Get-ProfileCleanupPathAttribute -Path ([System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Path))))
+            return $false
+        }
+        catch [System.IO.DirectoryNotFoundException] {
+            [void](Get-ProfileCleanupPathAttribute -Path ([System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Path))))
             return $false
         }
 
-        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        if ($attributes -band [System.IO.FileAttributes]::ReparsePoint) {
             throw [System.IO.IOException]::new("Profile cleanup cannot follow a reparse point: '$Path'.")
         }
-        if (-not $item.PSIsContainer) {
+        if (-not ($attributes -band [System.IO.FileAttributes]::Directory)) {
             throw [System.IO.IOException]::new("Profile cleanup target is not a directory: '$Path'.")
         }
         return $true
@@ -370,6 +382,7 @@ function WinDeleteUserProfiles {
                 'Get-SourceTextLoc',
                 'Write-ToolkitLog',
                 'Invoke-ProfileCleanupCommand',
+                'Get-ProfileCleanupPathAttribute',
                 'Test-ProfileCleanupDirectory',
                 'Assert-ProfileCleanupProfileState',
                 'Remove-ItemSafely',
