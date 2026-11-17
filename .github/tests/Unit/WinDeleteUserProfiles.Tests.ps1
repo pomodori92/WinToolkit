@@ -18,6 +18,10 @@ Describe 'WinDeleteUserProfiles safe regressions' {
 
         $definitions = @(
             @{ Path = $toolPath; Name = 'Write-ProfileCleanupMessage' },
+            @{ Path = $toolPath; Name = 'New-ProfileCleanupProgress' },
+            @{ Path = $toolPath; Name = 'Write-ProfileCleanupProgress' },
+            @{ Path = $toolPath; Name = 'Start-ProfileCleanupProgressRenderer' },
+            @{ Path = $toolPath; Name = 'Stop-ProfileCleanupProgress' },
             @{ Path = $toolPath; Name = 'Write-ProfileCleanupTable' },
             @{ Path = $toolPath; Name = 'New-ProtectedNameSet' },
             @{ Path = $toolPath; Name = 'Test-ProtectedLocalAccount' },
@@ -39,6 +43,7 @@ Describe 'WinDeleteUserProfiles safe regressions' {
             @{ Path = $uiPath; Name = 'Clear-ProgressLine' },
             @{ Path = $uiPath; Name = 'Write-ProgressUpdate' }
         )
+        $script:ProgressHelperDefinitions = [System.Collections.Generic.List[string]]::new()
         foreach ($definition in $definitions) {
             $path = if ($CompiledScriptPath) { $CompiledScriptPath } else { $definition.Path }
             $errors = $null
@@ -50,9 +55,13 @@ Describe 'WinDeleteUserProfiles safe regressions' {
             }, $true)
             if (-not $function) { throw "Missing helper $($definition.Name) in $path" }
             . ([scriptblock]::Create($function.Extent.Text))
+            if ($definition.Name -in @('New-ProfileCleanupProgress', 'Write-ProfileCleanupProgress', 'Start-ProfileCleanupProgressRenderer', 'Stop-ProfileCleanupProgress')) {
+                $script:ProgressHelperDefinitions.Add($function.Extent.Text)
+            }
         }
 
         $script:StyledMessageImplementation = ${function:Write-StyledMessage}
+        $script:ProgressRendererImplementation = ${function:Start-ProfileCleanupProgressRenderer}
         $entryPath = if ($CompiledScriptPath) { $CompiledScriptPath } else { $toolPath }
         $entryAst = [System.Management.Automation.Language.Parser]::ParseFile($entryPath, [ref]$null, [ref]$null)
         $entry = $entryAst.Find({
@@ -118,9 +127,14 @@ Describe 'WinDeleteUserProfiles safe regressions' {
             Error = @{ Icon = '[ERROR]'; Color = 'Red' }
         }
         $script:ConsoleMessages = [System.Collections.Generic.List[string]]::new()
+        $script:ProgressFrames = [System.Collections.Generic.List[object]]::new()
+        $profileCleanupClock = [System.Diagnostics.Stopwatch]::StartNew()
         Set-Content -LiteralPath $Global:CurrentLogFile -Value '' -Encoding UTF8
         Mock Write-Host { $script:ConsoleMessages.Add([string]$Object) }
-        Mock Write-ProgressUpdate {}
+        Mock Write-ProgressUpdate {
+            $script:ProgressFrames.Add([pscustomobject]@{ Activity = $Activity; Status = $Status; Percent = $Percent })
+        }
+        Mock Start-ProfileCleanupProgressRenderer {}
         Mock Clear-ProgressLine {}
         Mock Write-StyledMessage { & $script:StyledMessageImplementation -Type $Type -Text $Text -NoNewline:$NoNewline }
         Mock Remove-CimInstance { throw 'Unexpected CIM deletion in regression test' }
@@ -430,6 +444,8 @@ Describe 'WinDeleteUserProfiles safe regressions' {
             $results[1].Success | Should -BeTrue
             $results[1].Type | Should -Be 'LocalAccount'
             Should -Invoke Remove-LocalUser -Times 2 -Exactly
+            $script:ProgressFrames[-1].Percent | Should -Be 50
+            $script:ProgressFrames[-1].Status | Should -Match '^- 1/2 account locali rimossi - \d{2}:\d{2}:\d{2}$'
         }
 
         It 'does not count failed account verification as successful deletion' {
@@ -641,6 +657,181 @@ Describe 'WinDeleteUserProfiles safe regressions' {
         }
     }
 
+    Context 'Live phase cleanup progress' {
+        It 'formats integer progress and elapsed time for <Culture> <Key>' -ForEach @(
+            @{ Culture = 'en-US'; Key = 'toolText.profileRemovalProgress'; Noun = 'user profiles removed' },
+            @{ Culture = 'en-US'; Key = 'toolText.residualFolderRemovalProgress'; Noun = 'residual folders removed' },
+            @{ Culture = 'en-US'; Key = 'toolText.localAccountRemovalProgress'; Noun = 'local accounts removed' },
+            @{ Culture = 'it-IT'; Key = 'toolText.profileRemovalProgress'; Noun = 'profili utente rimossi' },
+            @{ Culture = 'it-IT'; Key = 'toolText.residualFolderRemovalProgress'; Noun = 'cartelle residue rimosse' },
+            @{ Culture = 'it-IT'; Key = 'toolText.localAccountRemovalProgress'; Noun = 'account locali rimossi' }
+        ) {
+            if ($Culture -eq 'en-US') { $Global:SourceTextLanguageData = $script:EnglishData.Clone() }
+            $clock = [pscustomobject]@{ Elapsed = [TimeSpan]::FromSeconds(90061.9) }
+            $progress = New-ProfileCleanupProgress -Total 3 -Activity 'Cleanup' -StatusTemplate (Get-SourceTextLoc $Key) -Clock $clock
+            try {
+                Write-ProfileCleanupProgress -Progress $progress
+                Write-ProfileCleanupProgress -Progress $progress -Removed
+                Write-ProfileCleanupProgress -Progress $progress
+                Write-ProfileCleanupProgress -Progress $progress -Removed
+
+                ($script:ProgressFrames.Percent -join ',') | Should -Be '0,33,33,66'
+                $script:ProgressFrames[0].Status | Should -Be "- 0/3 $Noun - 25:01:01"
+                $script:ProgressFrames[-1].Status | Should -Be "- 2/3 $Noun - 25:01:01"
+            }
+            finally { Stop-ProfileCleanupProgress -Progress $progress }
+        }
+
+        It 'resets successful counts for all three phases while retaining the cleanup clock' {
+            $profileCleanupClock = [pscustomobject]@{ Elapsed = [TimeSpan]::FromSeconds(3661) }
+            $script:PhaseClocks = [System.Collections.Generic.List[object]]::new()
+            Mock Start-ProfileCleanupProgressRenderer { $script:PhaseClocks.Add($Progress.Clock) }
+            Mock Remove-UserProfile { [pscustomobject]@{ Success = $true } }
+            Mock Remove-Item {}
+            Mock Test-ProtectedLocalAccount { $false }
+            Mock Get-RemovableLocalAccounts { $Accounts }
+            Mock Get-LocalUser { if ($SID) { [pscustomobject]@{ Name = 'Account'; SID = 'S-1-5-21-100-200-300-1101' } } }
+            Mock Remove-LocalUser {}
+
+            [void](Invoke-ProfileRemovalBatch -Profiles @([pscustomobject]@{ LocalPath = (Join-Path $TestDrive 'Profile'); SID = 'profile' }))
+            [void](Remove-ResidualUserFolders -Folders @([pscustomobject]@{ Name = 'Residual'; Path = (Join-Path $TestDrive 'AbsentResidual') }))
+            [void](Remove-LocalUserAccounts -Accounts @([pscustomobject]@{ Name = 'Account'; SID = 'S-1-5-21-100-200-300-1101' }))
+
+            ($script:ProgressFrames.Percent -join ',') | Should -Be '0,100,0,100,0,100'
+            ($script:ProgressFrames.Status -join '|') | Should -Be (
+                '- 0/1 profili utente rimossi - 01:01:01|- 1/1 profili utente rimossi - 01:01:01|' +
+                '- 0/1 cartelle residue rimosse - 01:01:01|- 1/1 cartelle residue rimosse - 01:01:01|' +
+                '- 0/1 account locali rimossi - 01:01:01|- 1/1 account locali rimossi - 01:01:01'
+            )
+            $script:PhaseClocks.Count | Should -Be 3
+            foreach ($clock in $script:PhaseClocks) { [object]::ReferenceEquals($clock, $profileCleanupClock) | Should -BeTrue }
+        }
+
+        It 'serializes permanent messages with timer cursor updates' {
+            $profileCleanupProgress = New-ProfileCleanupProgress -Total 1 -Activity 'Cleanup' -StatusTemplate '- {0}/{1} removed - {2}'
+            $profileCleanupProgress.LineStart = [pscustomobject]@{ X = 0; Y = 3 }
+            $profileCleanupProgress.LineRows = 2
+            $script:MessageProgress = $profileCleanupProgress
+            Mock Clear-ProgressLine {
+                [System.Threading.Monitor]::IsEntered($script:MessageProgress.SyncRoot) | Should -BeTrue
+                $Global:ProgressLineStart.Y | Should -Be 3
+                $Global:ProgressLineStart = $null
+                $Global:ProgressLineRows = 0
+            }
+            try {
+                Write-ProfileCleanupMessage -Type Info -Text 'Permanent result'
+
+                $profileCleanupProgress.LineStart | Should -BeNullOrEmpty
+                $profileCleanupProgress.LineRows | Should -Be 0
+                [System.Threading.Monitor]::IsEntered($profileCleanupProgress.SyncRoot) | Should -BeFalse
+                Should -Invoke Write-StyledMessage -Times 1 -Exactly -ParameterFilter { $Text -eq 'Permanent result' }
+            }
+            finally {
+                Mock Clear-ProgressLine {}
+                Stop-ProfileCleanupProgress -Progress $profileCleanupProgress
+            }
+        }
+
+        It 'disposes phase resources when renderer startup fails before deletion' {
+            Mock Start-ProfileCleanupProgressRenderer {
+                $script:FailedProgress = $Progress
+                throw 'Synthetic renderer startup failure'
+            }
+            Mock Remove-UserProfile { throw 'Profile removal must not start' }
+
+            { Invoke-ProfileRemovalBatch -Profiles @([pscustomobject]@{ LocalPath = 'C:\Unused'; SID = 'unused' }) } |
+                Should -Throw '*Synthetic renderer startup failure*'
+
+            { $script:FailedProgress.StopEvent.Wait(0) } | Should -Throw '*disposed*'
+            Should -Invoke Clear-ProgressLine -Times 1 -Exactly
+            Should -Invoke Remove-UserProfile -Times 0 -Exactly
+        }
+
+        It 'does not start a console renderer during a GUI session' {
+            $Global:GuiSessionActive = $true
+            $progress = New-ProfileCleanupProgress -Total 1 -Activity 'Cleanup' -StatusTemplate '- {0}/{1} removed - {2}'
+            try {
+                & $script:ProgressRendererImplementation -Progress $progress
+                Write-ProfileCleanupProgress -Progress $progress -Removed
+
+                $progress.Worker | Should -BeNullOrEmpty
+                $progress.Runspace | Should -BeNullOrEmpty
+                $progress.Removed | Should -Be 1
+                Should -Invoke Write-ProgressUpdate -Times 0 -Exactly
+            }
+            finally { Stop-ProfileCleanupProgress -Progress $progress }
+        }
+
+        It 'refreshes while the deletion thread blocks and shuts down after <Mode>' -ForEach @(
+            @{ Mode = 'success'; FailTick = $false },
+            @{ Mode = 'renderer failure'; FailTick = $true }
+        ) {
+            # Isolate real helpers from Pester mocks. The renderer stub records ticks without touching the console.
+            $probe = [System.Management.Automation.PowerShell]::Create()
+            try {
+                [void]$probe.AddScript(($script:ProgressHelperDefinitions -join "`n"))
+                [void]$probe.AddScript({
+                    param($FailTick)
+                    function Clear-ProgressLine {}
+                    function Show-ProgressBar {}
+                    function Write-ProgressUpdate {
+                        param($Activity, $Status, $Percent, $Icon)
+                        if ($Progress.FailTick) {
+                            $Progress.FirstTick.Set()
+                            throw 'Synthetic timer tick failure'
+                        }
+                        $Progress.Frames.Add($Status)
+                        $Progress.FirstTick.Set()
+                    }
+                    $Global:GuiSessionActive = $false
+                    $progress = New-ProfileCleanupProgress -Total 1 -Activity 'Probe' -StatusTemplate '- {0}/{1} user profiles removed - {2}'
+                    $progress.Frames = [System.Collections.Generic.List[string]]::new()
+                    $progress.FirstTick = [System.Threading.ManualResetEventSlim]::new($false)
+                    $progress.FailTick = $FailTick
+                    $stopError = $null
+                    try {
+                        Start-ProfileCleanupProgressRenderer -Progress $progress
+                        if (-not $progress.FirstTick.Wait(5000)) { throw 'Timer renderer did not report its first tick' }
+                        $countBeforeBlock = $progress.Frames.Count
+                        [System.Threading.Thread]::Sleep(1200)
+                    }
+                    finally {
+                        try { Stop-ProfileCleanupProgress -Progress $progress }
+                        catch { $stopError = $_.Exception.Message }
+                        finally { $progress.FirstTick.Dispose() }
+                    }
+                    $countAfterStop = $progress.Frames.Count
+                    [System.Threading.Thread]::Sleep(1100)
+                    $eventDisposed = $false
+                    try { [void]$progress.StopEvent.Wait(0) }
+                    catch [System.ObjectDisposedException] { $eventDisposed = $true }
+                    [pscustomobject]@{
+                        Frames = $progress.Frames.ToArray(); CountBeforeBlock = $countBeforeBlock; CountAfterStop = $countAfterStop
+                        FinalCount = $progress.Frames.Count; StopError = $stopError
+                        EventDisposed = $eventDisposed; ClockRunning = $progress.Clock.IsRunning
+                        RunspaceState = $progress.Runspace.RunspaceStateInfo.State
+                    }
+                }).AddArgument($FailTick)
+                $result = @($probe.Invoke())
+
+                $probe.Streams.Error.Count | Should -Be 0
+                $result.Count | Should -Be 1
+                $result[0].FinalCount | Should -Be $result[0].CountAfterStop
+                $result[0].EventDisposed | Should -BeTrue
+                $result[0].ClockRunning | Should -BeFalse
+                [string]$result[0].RunspaceState | Should -Be 'Closed'
+                if ($FailTick) { $result[0].StopError | Should -Match 'Synthetic timer tick failure' }
+                else {
+                    $result[0].StopError | Should -BeNullOrEmpty
+                    $result[0].CountAfterStop | Should -BeGreaterThan $result[0].CountBeforeBlock
+                    $result[0].Frames[0] | Should -Match '^- 0/1 user profiles removed - \d{2}:\d{2}:\d{2}$'
+                    $result[0].Frames[0] | Should -Not -Be $result[0].Frames[1]
+                }
+            }
+            finally { $probe.Dispose() }
+        }
+    }
+
     Context 'Sequential registered-profile removal' {
         BeforeEach {
             $script:SequenceEvents = [System.Collections.Generic.List[string]]::new()
@@ -695,7 +886,7 @@ Describe 'WinDeleteUserProfiles safe regressions' {
             $results[1].Sid | Should -Be $script:SequentialProfiles[1].SID
             $results[2].Success | Should -BeTrue
             Get-Content -LiteralPath $Global:CurrentLogFile -Raw | Should -Match '\[ERROR\].*Synthetic profile failure'
-            $script:BatchProgress[-1] | Should -Be 100
+            $script:BatchProgress[-1] | Should -Be 66
         }
 
         It 'uses the current localization and logging context without copying state' {
@@ -816,6 +1007,9 @@ Describe 'WinDeleteUserProfiles safe regressions' {
 
         It 'reports a residual folder failure when ACL recovery cannot remove it' {
             Mock Remove-Item { throw 'Synthetic access denied' }
+            Mock Write-ProgressUpdate {
+                $script:ProgressFrames.Add([pscustomobject]@{ Status = $Status; Percent = $Percent })
+            }
             $folder = [pscustomobject]@{ Name = 'Issue189[Probe]'; Path = $script:ProbeFolderPath }
 
             $result = Remove-ResidualUserFolders -Folders @($folder)
@@ -824,6 +1018,8 @@ Describe 'WinDeleteUserProfiles safe regressions' {
             [System.IO.Directory]::Exists($script:ProbeFolderPath) | Should -BeTrue
             Should -Invoke Remove-Item -Times 2 -Exactly
             Get-Content -LiteralPath $Global:CurrentLogFile -Raw | Should -Match '\[ERROR\].*Synthetic access denied'
+            $script:ProgressFrames[-1].Percent | Should -Be 0
+            $script:ProgressFrames[-1].Status | Should -Match '^- 0/1 cartelle residue rimosse - \d{2}:\d{2}:\d{2}$'
         }
     }
 

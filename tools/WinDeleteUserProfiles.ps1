@@ -97,8 +97,137 @@ function WinDeleteUserProfiles {
             [string]$Text
         )
 
-        if ($Global:ProgressLineStart) { Clear-ProgressLine }
-        Write-StyledMessage -Type $Type -Text $Text
+        $progress = Get-Variable -Name profileCleanupProgress -ValueOnly -ErrorAction SilentlyContinue
+        if ($progress) { [System.Threading.Monitor]::Enter($progress.SyncRoot) }
+        try {
+            if ($progress) {
+                $Global:ProgressLineStart = $progress.LineStart
+                $Global:ProgressLineRows = $progress.LineRows
+            }
+            if ($Global:ProgressLineStart) { Clear-ProgressLine }
+            Write-StyledMessage -Type $Type -Text $Text
+        }
+        finally {
+            if ($progress) {
+                $progress.LineStart = $Global:ProgressLineStart
+                $progress.LineRows = $Global:ProgressLineRows
+                [System.Threading.Monitor]::Exit($progress.SyncRoot)
+            }
+        }
+    }
+
+    # Share only presentation state with the timer; deletion and localization remain in this runspace.
+    function New-ProfileCleanupProgress {
+        param(
+            [int]$Total,
+            [string]$Activity,
+            [string]$StatusTemplate,
+            [object]$Clock = $profileCleanupClock
+        )
+
+        $ownsClock = $null -eq $Clock
+        if ($ownsClock) { $Clock = [System.Diagnostics.Stopwatch]::StartNew() }
+        return @{
+            Total = $Total; Removed = 0; Activity = $Activity; StatusTemplate = $StatusTemplate
+            Clock = $Clock; OwnsClock = $ownsClock; SyncRoot = [object]::new()
+            StopEvent = [System.Threading.ManualResetEventSlim]::new($false)
+            GuiSessionActive = [bool]$Global:GuiSessionActive
+            LineStart = $Global:ProgressLineStart; LineRows = $Global:ProgressLineRows
+            Worker = $null; Runspace = $null; Handle = $null; RendererError = $null
+        }
+    }
+
+    # The foreground and timer use the same renderer and cursor state under one console lock.
+    function Write-ProfileCleanupProgress {
+        param([hashtable]$Progress, [switch]$Removed)
+
+        [System.Threading.Monitor]::Enter($Progress.SyncRoot)
+        try {
+            if ($Progress.RendererError) { throw $Progress.RendererError }
+            if ($Removed) { $Progress.Removed++ }
+            if ($Progress.GuiSessionActive) { return }
+            # A completed bar already commits a newline; timer ticks must not print it again.
+            if (-not $Removed -and $Progress.Total -gt 0 -and $Progress.Removed -ge $Progress.Total) { return }
+
+            $elapsed = $Progress.Clock.Elapsed
+            $elapsedText = '{0:00}:{1:00}:{2:00}' -f [math]::Floor($elapsed.TotalHours), $elapsed.Minutes, $elapsed.Seconds
+            $percent = if ($Progress.Total -gt 0) { [int][math]::Floor(100 * $Progress.Removed / $Progress.Total) } else { 100 }
+            $status = $Progress.StatusTemplate -f $Progress.Removed, $Progress.Total, $elapsedText
+            $Global:ProgressLineStart = $Progress.LineStart
+            $Global:ProgressLineRows = $Progress.LineRows
+            try {
+                Write-ProgressUpdate -Activity $Progress.Activity -Status $status -Percent $percent -Icon '🗑️'
+            }
+            finally {
+                $Progress.LineStart = $Global:ProgressLineStart
+                $Progress.LineRows = $Global:ProgressLineRows
+            }
+        }
+        finally {
+            [System.Threading.Monitor]::Exit($Progress.SyncRoot)
+        }
+    }
+
+    # A presentation-only runspace keeps the elapsed timer live while a deletion cmdlet blocks.
+    function Start-ProfileCleanupProgressRenderer {
+        param([hashtable]$Progress)
+
+        if ($Progress.GuiSessionActive -or $Progress.Total -eq 0) { return }
+        $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+        foreach ($name in @('Clear-ProgressLine', 'Show-ProgressBar', 'Write-ProgressUpdate', 'Write-ProfileCleanupProgress')) {
+            $definition = (Get-Command -Name $name -CommandType Function -ErrorAction Stop).Definition
+            $sessionState.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($name, $definition))
+        }
+        $Progress.Runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($Host, $sessionState)
+        $Progress.Runspace.Open()
+        $Progress.Worker = [System.Management.Automation.PowerShell]::Create()
+        $Progress.Worker.Runspace = $Progress.Runspace
+        [void]$Progress.Worker.AddScript({
+            param($Progress)
+            $ErrorActionPreference = 'Stop'
+            $Global:GuiSessionActive = $Progress.GuiSessionActive
+            try {
+                while (-not $Progress.StopEvent.Wait(1000)) {
+                    Write-ProfileCleanupProgress -Progress $Progress
+                }
+            }
+            catch {
+                [System.Threading.Monitor]::Enter($Progress.SyncRoot)
+                try { $Progress.RendererError = $_ }
+                finally { [System.Threading.Monitor]::Exit($Progress.SyncRoot) }
+                throw
+            }
+        }).AddArgument($Progress)
+        $Progress.Handle = $Progress.Worker.BeginInvoke()
+    }
+
+    # Join before clearing so a late timer tick cannot overwrite the following phase or summary.
+    function Stop-ProfileCleanupProgress {
+        param([hashtable]$Progress)
+
+        try {
+            $Progress.StopEvent.Set()
+            if ($Progress.Handle) { [void]$Progress.Worker.EndInvoke($Progress.Handle) }
+        }
+        finally {
+            try {
+                [System.Threading.Monitor]::Enter($Progress.SyncRoot)
+                try {
+                    $Global:ProgressLineStart = $Progress.LineStart
+                    $Global:ProgressLineRows = $Progress.LineRows
+                    if (-not $Progress.GuiSessionActive) { Clear-ProgressLine }
+                }
+                finally {
+                    [System.Threading.Monitor]::Exit($Progress.SyncRoot)
+                }
+            }
+            finally {
+                if ($Progress.Worker) { $Progress.Worker.Dispose() }
+                if ($Progress.Runspace) { $Progress.Runspace.Dispose() }
+                $Progress.StopEvent.Dispose()
+                if ($Progress.OwnsClock) { $Progress.Clock.Stop() }
+            }
+        }
     }
 
     # Render target data once so the console and structured log retain the same complete rows.
@@ -210,38 +339,49 @@ function WinDeleteUserProfiles {
             [array]$ProfileResults = @()
         )
 
-        foreach ($account in $Accounts) {
-            $start = Get-Date
-            $sid = [string]$account.SID
-            $success = $false
-            if (Test-ProtectedLocalAccount -Account $account) { continue }
+        $profileCleanupProgress = New-ProfileCleanupProgress -Total $Accounts.Count `
+            -Activity (Get-SourceTextLoc 'toolText.extra.removingLocalAccounts') `
+            -StatusTemplate (Get-SourceTextLoc 'toolText.localAccountRemovalProgress')
+        try {
+            Write-ProfileCleanupProgress -Progress $profileCleanupProgress
+            Start-ProfileCleanupProgressRenderer -Progress $profileCleanupProgress
+            foreach ($account in $Accounts) {
+                $start = Get-Date
+                $sid = [string]$account.SID
+                $success = $false
+                if (Test-ProtectedLocalAccount -Account $account) { continue }
 
-            try {
-                # Refresh activity immediately before deletion; failures here must never permit removal.
-                # Resolve names again by SID and repeat every exclusion in case identity or profile state changed.
-                $currentAccount = Get-LocalUser -SID $sid -ErrorAction Stop
-                $eligibleAccounts = @(Get-RemovableLocalAccounts -Accounts @($currentAccount) -ProfileResults $ProfileResults)
-                if ($eligibleAccounts.Count -ne 1) {
-                    throw (Get-SourceTextLoc 'toolText.localAccountProtected0' -Args @($account.Name))
+                try {
+                    # Refresh activity immediately before deletion; failures here must never permit removal.
+                    # Resolve names again by SID and repeat every exclusion in case identity or profile state changed.
+                    $currentAccount = Get-LocalUser -SID $sid -ErrorAction Stop
+                    $eligibleAccounts = @(Get-RemovableLocalAccounts -Accounts @($currentAccount) -ProfileResults $ProfileResults)
+                    if ($eligibleAccounts.Count -ne 1) {
+                        throw (Get-SourceTextLoc 'toolText.localAccountProtected0' -Args @($account.Name))
+                    }
+                    Remove-LocalUser -SID $sid -ErrorAction Stop -Confirm:$false
+                    if (@(Get-LocalUser -ErrorAction Stop | Where-Object { [string]$_.SID -eq $sid }).Count -gt 0) {
+                        throw (Get-SourceTextLoc 'toolText.localAccountStillExists0' -Args @($sid))
+                    }
+                    $success = $true
+                    Write-ProfileCleanupMessage -Type 'Success' -Text (Get-SourceTextLoc 'toolText.localAccountRemoved01' -Args @($account.Name, $sid))
                 }
-                Remove-LocalUser -SID $sid -ErrorAction Stop -Confirm:$false
-                if (@(Get-LocalUser -ErrorAction Stop | Where-Object { [string]$_.SID -eq $sid }).Count -gt 0) {
-                    throw (Get-SourceTextLoc 'toolText.localAccountStillExists0' -Args @($sid))
+                catch {
+                    Write-ProfileCleanupMessage -Type 'Error' -Text (Get-SourceTextLoc 'toolText.localAccountRemovalFailed01' -Args @($account.Name, $_.Exception.Message))
                 }
-                $success = $true
-                Write-ProfileCleanupMessage -Type 'Success' -Text (Get-SourceTextLoc 'toolText.localAccountRemoved01' -Args @($account.Name, $sid))
-            }
-            catch {
-                Write-ProfileCleanupMessage -Type 'Error' -Text (Get-SourceTextLoc 'toolText.localAccountRemovalFailed01' -Args @($account.Name, $_.Exception.Message))
-            }
 
-            [PSCustomObject]@{
-                Type     = 'LocalAccount'
-                UserName = $account.Name
-                Sid      = $sid
-                Success  = $success
-                Duration = New-TimeSpan -Start $start -End (Get-Date)
+                [PSCustomObject]@{
+                    Type     = 'LocalAccount'
+                    UserName = $account.Name
+                    Sid      = $sid
+                    Success  = $success
+                    Duration = New-TimeSpan -Start $start -End (Get-Date)
+                }
+                Write-ProfileCleanupProgress -Progress $profileCleanupProgress -Removed:$success
             }
+        }
+        finally {
+            Stop-ProfileCleanupProgress -Progress $profileCleanupProgress
         }
     }
 
@@ -460,15 +600,16 @@ function WinDeleteUserProfiles {
         )
 
         $results = [System.Collections.Generic.List[object]]::new()
-        $total = $Profiles.Count
-        $completed = 0
+        $profileCleanupProgress = New-ProfileCleanupProgress -Total $Profiles.Count `
+            -Activity (Get-SourceTextLoc 'toolText.extra.removingRegisteredProfiles') `
+            -StatusTemplate (Get-SourceTextLoc 'toolText.profileRemovalProgress')
 
         try {
+            Write-ProfileCleanupProgress -Progress $profileCleanupProgress
+            Start-ProfileCleanupProgressRenderer -Progress $profileCleanupProgress
             foreach ($profileItem in $Profiles) {
                 $userName = [System.IO.Path]::GetFileName($profileItem.LocalPath)
                 $start = Get-Date
-                $percent = if ($total -gt 0) { [math]::Floor(($completed / $total) * 100) } else { 100 }
-                Write-ProgressUpdate -Activity (Get-SourceTextLoc 'toolText.extra.removingRegisteredProfiles') -Status ("{0} / {1} - {2}" -f ($completed + 1), $total, $userName) -Percent $percent -Icon '🗑️'
 
                 try {
                     $result = Remove-UserProfile -ProfileItem $profileItem
@@ -487,16 +628,13 @@ function WinDeleteUserProfiles {
                 }
 
                 $results.Add($result)
-                $completed++
-                $percent = if ($total -gt 0) { [math]::Floor(($completed / $total) * 100) } else { 100 }
-                Write-ProgressUpdate -Activity (Get-SourceTextLoc 'toolText.extra.removingRegisteredProfiles') -Status (Get-SourceTextLoc 'toolText.extra.01Completed' -Args @($completed, $total)) -Percent $percent -Icon '🗑️'
+                Write-ProfileCleanupProgress -Progress $profileCleanupProgress -Removed:$result.Success
             }
 
-            Write-ProgressUpdate -Activity (Get-SourceTextLoc 'toolText.extra.removingRegisteredProfiles') -Status (Get-SourceTextLoc 'uiText.completed') -Percent 100 -Icon '✅'
             return $results
         }
         finally {
-            Clear-ProgressLine
+            Stop-ProfileCleanupProgress -Progress $profileCleanupProgress
         }
     }
 
@@ -564,71 +702,72 @@ function WinDeleteUserProfiles {
         )
 
         $results = [System.Collections.Generic.List[object]]::new()
-        $total = $Folders.Count
-        $index = 0
+        $profileCleanupProgress = New-ProfileCleanupProgress -Total $Folders.Count `
+            -Activity (Get-SourceTextLoc 'toolText.extra.removingResidualFoldersInCUsers') `
+            -StatusTemplate (Get-SourceTextLoc 'toolText.residualFolderRemovalProgress')
+        try {
+            Write-ProfileCleanupProgress -Progress $profileCleanupProgress
+            Start-ProfileCleanupProgressRenderer -Progress $profileCleanupProgress
+            foreach ($folder in $Folders) {
+                $start = Get-Date
+                $success = $false
 
-        foreach ($folder in $Folders) {
-            $index++
-            $percent = if ($total -gt 0) { [math]::Floor(($index / $total) * 100) } else { 100 }
+                Write-ProfileCleanupMessage -Type 'Info' -Text (Get-SourceTextLoc 'toolText.startResidualFolder01' -Args @($($folder.Name), $($folder.Path)))
 
-            Write-ProgressUpdate -Activity (Get-SourceTextLoc 'toolText.extra.removingResidualFoldersInCUsers') -Status ("{0} / {1} - {2}" -f $index, $total, $folder.Name) -Percent $percent -Icon '🗑️'
+                $folderPath = $folder.Path
 
-            $start = Get-Date
-            $success = $false
-
-            Write-ProfileCleanupMessage -Type 'Info' -Text (Get-SourceTextLoc 'toolText.startResidualFolder01' -Args @($($folder.Name), $($folder.Path)))
-
-            $folderPath = $folder.Path
-
-            try {
-                # Literal paths preserve folder names containing wildcard characters during deletion.
-                Remove-Item -LiteralPath $folderPath -Force -Recurse -ErrorAction Stop -Confirm:$false
-                # A completed command is insufficient; verify that the directory is actually gone.
-                $success = -not [System.IO.Directory]::Exists($folderPath)
-            }
-            catch {
-                Write-ProfileCleanupMessage -Type 'Warning' -Text (Get-SourceTextLoc 'toolText.standardResidualFolderRemovalFailed01' -Args @($folderPath, $($_.Exception.Message)))
-
-                # Retry with ownership and access repaired when normal filesystem deletion fails.
                 try {
-                    Invoke-ExternalCommandWithLog -Command 'takeown.exe' -Arguments @('/F', "`"$folderPath`"", '/R', '/D', 'Y') -LogContextKey "ResidualTakeOwn-$($folder.Name)" | Out-Null
-                    # S-1-5-32-544 - Fixed SID across Windows languages; avoids depending on localized group names.
-                    Invoke-ExternalCommandWithLog -Command 'icacls.exe' -Arguments @("`"$folderPath`"", '/grant', '*S-1-5-32-544:F', '/T', '/C') -LogContextKey "ResidualIcacls-$($folder.Name)" | Out-Null
-                    Remove-Item -LiteralPath $folderPath -Recurse -Force -ErrorAction Stop -Confirm:$false
+                    # Literal paths preserve folder names containing wildcard characters during deletion.
+                    Remove-Item -LiteralPath $folderPath -Force -Recurse -ErrorAction Stop -Confirm:$false
+                    # A completed command is insufficient; verify that the directory is actually gone.
                     $success = -not [System.IO.Directory]::Exists($folderPath)
                 }
                 catch {
-                    Write-ProfileCleanupMessage -Type 'Error' -Text (Get-SourceTextLoc 'toolText.remnantFolderRemovalFailed01' -Args @($folderPath, $($_.Exception.Message)))
-                    $success = $false
+                    Write-ProfileCleanupMessage -Type 'Warning' -Text (Get-SourceTextLoc 'toolText.standardResidualFolderRemovalFailed01' -Args @($folderPath, $($_.Exception.Message)))
+
+                    # Retry with ownership and access repaired when normal filesystem deletion fails.
+                    try {
+                        Invoke-ExternalCommandWithLog -Command 'takeown.exe' -Arguments @('/F', "`"$folderPath`"", '/R', '/D', 'Y') -LogContextKey "ResidualTakeOwn-$($folder.Name)" | Out-Null
+                        # S-1-5-32-544 - Fixed SID across Windows languages; avoids depending on localized group names.
+                        Invoke-ExternalCommandWithLog -Command 'icacls.exe' -Arguments @("`"$folderPath`"", '/grant', '*S-1-5-32-544:F', '/T', '/C') -LogContextKey "ResidualIcacls-$($folder.Name)" | Out-Null
+                        Remove-Item -LiteralPath $folderPath -Recurse -Force -ErrorAction Stop -Confirm:$false
+                        $success = -not [System.IO.Directory]::Exists($folderPath)
+                    }
+                    catch {
+                        Write-ProfileCleanupMessage -Type 'Error' -Text (Get-SourceTextLoc 'toolText.remnantFolderRemovalFailed01' -Args @($folderPath, $($_.Exception.Message)))
+                        $success = $false
+                    }
                 }
+
+                $duration = New-TimeSpan -Start $start -End (Get-Date)
+
+                if ($success) {
+                    Write-ProfileCleanupMessage -Type 'Success' -Text (Get-SourceTextLoc 'toolText.completedResidualFolder01' -Args @($($folder.Name), $duration.ToString()))
+                }
+                else {
+                    Write-ProfileCleanupMessage -Type 'Error' -Text (Get-SourceTextLoc 'toolText.failedResidualFolder0' -Args @($($folder.Name)))
+                }
+
+                $results.Add([PSCustomObject]@{
+                        Type     = 'ResidualFolder'
+                        UserName = $folder.Name
+                        Path     = $folder.Path
+                        Success  = $success
+                        Duration = $duration
+                    }) | Out-Null
+                Write-ProfileCleanupProgress -Progress $profileCleanupProgress -Removed:$success
             }
 
-            $duration = New-TimeSpan -Start $start -End (Get-Date)
-
-            if ($success) {
-                Write-ProfileCleanupMessage -Type 'Success' -Text (Get-SourceTextLoc 'toolText.completedResidualFolder01' -Args @($($folder.Name), $duration.ToString()))
-            }
-            else {
-                Write-ProfileCleanupMessage -Type 'Error' -Text (Get-SourceTextLoc 'toolText.failedResidualFolder0' -Args @($($folder.Name)))
-            }
-
-            $results.Add([PSCustomObject]@{
-                    Type     = 'ResidualFolder'
-                    UserName = $folder.Name
-                    Path     = $folder.Path
-                    Success  = $success
-                    Duration = $duration
-                }) | Out-Null
+            return $results
         }
-
-        Write-ProgressUpdate -Activity (Get-SourceTextLoc 'toolText.extra.removingResidualFoldersInCUsers') -Status (Get-SourceTextLoc 'uiText.completed') -Percent 100 -Icon '✅'
-        Clear-ProgressLine
-
-        return $results
+        finally {
+            Stop-ProfileCleanupProgress -Progress $profileCleanupProgress
+        }
     }
 
     # Both cleanup phases share the toolkit's progress, localization, and log context.
     Start-ToolkitSession -ToolName $script:ToolName -SubTitle (Get-SourceTextLoc 'script.WinDeleteUserProfiles')
+    $profileCleanupClock = [System.Diagnostics.Stopwatch]::StartNew()
 
     try {
         # Validate the configured directory before either cleanup phase can delete anything.
@@ -755,6 +894,7 @@ function WinDeleteUserProfiles {
         throw
     }
     finally {
+        $profileCleanupClock.Stop()
         # Report that the session ended even when a cleanup phase throws.
         Write-ProfileCleanupMessage -Type 'Info' -Text ("♻️ " + (Get-SourceTextLoc 'toolText.winDeleteUserProfilesSessionEnded'))
     }
